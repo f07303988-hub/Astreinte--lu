@@ -550,7 +550,8 @@ async function pendingAdd(uuid_){ const p = await pendingGet(); p.add(uuid_); aw
 
 /* Téléphone connecté avec un compte « lecteur » : mode signalement.
    L'agent crée des incidents et complète les siens (photos), sans changer de statut, ni passation, ni réglages. */
-function modeSignalement(){ return !!(state.sync && state.sync.connected && state.sync.role === "lecteur"); }
+const ROLES_SIGNALEMENT = ["lecteur", "agent"];
+function modeSignalement(){ return !!(state.sync && state.sync.connected && ROLES_SIGNALEMENT.includes(state.sync.role)); }
 function estMonSignalement(id){ return !!(state.mesSignalements && state.mesSignalements.has(id)); }
 const MSG_SIGNALEMENT = "Mode signalement : seul l'incident que vous avez signalé peut être complété";
 
@@ -671,7 +672,7 @@ async function syncNow(manual){
     const pr = await sb.from("profils").select("role, nom").eq("id", session.user.id).maybeSingle();
     if(pr.error) throw pr.error;
     const role = pr.data && pr.data.role;
-    if(role === "lecteur" && pr.data.nom && pr.data.nom.trim()){
+    if(ROLES_SIGNALEMENT.includes(role) && pr.data.nom && pr.data.nom.trim()){
       const nom = pr.data.nom.trim().slice(0, 80);
       if(nom !== (await kvGet("srvNom", null))){ await kvSet("srvNom", nom); if(modeSignalement()) state.currentUser = nom; }
     }
@@ -892,7 +893,7 @@ async function connecterAgent(email, pass){
   if(error) throw error;
   const pr = await sb.from("profils").select("role, nom").eq("id", data.user.id).maybeSingle();
   const role = pr.data && pr.data.role;
-  if(role !== "lecteur"){
+  if(!ROLES_SIGNALEMENT.includes(role)){
     await sb.auth.signOut();
     throw new Error(role ? "Ce compte sert à la saisie complète : connectez-le par Administration › Serveur de la mairie." : "Ce compte est désactivé ou n'a pas de profil dans l'application des contrôles.");
   }
@@ -917,7 +918,7 @@ function renderConnexionAgent(){
   <div class="lockscreen">
     <div class="siren">👷</div>
     <h1 style="font-size:1.3rem;text-align:center;margin-bottom:0;">Connexion agent</h1>
-    <p style="color:var(--text-dim);text-align:center;margin-top:0;">Avec le compte de l'application des contrôles fourni par la mairie. À faire une seule fois sur ce téléphone.</p>
+    <p style="color:var(--text-dim);text-align:center;margin-top:0;">Avec l'identifiant et le mot de passe fournis par la mairie. À faire une seule fois sur ce téléphone.</p>
     <div class="card" style="width:100%;max-width:340px;">
       <label style="display:block;margin-bottom:10px;">Adresse e-mail<input id="agEmail" type="email" autocomplete="username" style="width:100%;"></label>
       <label style="display:block;margin-bottom:10px;">Mot de passe<input id="agPass" type="password" autocomplete="current-password" style="width:100%;"></label>
@@ -949,7 +950,7 @@ async function renderAdminServeur(){
     </div>
     ${connecte ? `
       <div class="card">
-        <p style="margin:0;"><b>Connecté</b> avec le compte <b>${esc(email)}</b>${modeSignalement() ? " · <b>mode signalement</b> (rôle lecteur)" : ""}</p>
+        <p style="margin:0;"><b>Connecté</b> avec le compte <b>${esc(email)}</b>${modeSignalement() ? " · <b>mode signalement</b>" : ""}</p>
         <p style="color:var(--text-dim);margin:8px 0 0;">${S.lastOk ? `Dernier échange : ${fmtDateTime(S.lastOk)}` : "Aucun échange pour le moment"}${S.pending ? ` · ${S.pending} incident${S.pending>1?"s":""} à envoyer` : ""}</p>
         ${S.error ? `<p style="color:var(--urgent);margin:8px 0 0;font-weight:700;">${esc(S.error)}</p>` : ""}
       </div>
@@ -957,7 +958,7 @@ async function renderAdminServeur(){
       <button class="big-btn secondary" id="srvLogout"><span class="ic">⏏️</span><span class="lbl">Déconnecter ce téléphone</span></button>
     ` : `
       <div class="card">
-        <p style="margin-top:0;">Connectez ce téléphone avec un compte de l'application des contrôles. Rôle <b>administrateur</b> ou <b>contributeur</b> : saisie des incidents (un compte dédié, par exemple astreinte@pasly.fr, est conseillé pour le téléphone d'astreinte). Rôle <b>lecteur</b> : mode signalement, l'agent signale des incidents et voit ceux des autres, sans changer les statuts.</p>
+        <p style="margin-top:0;">Connectez ce téléphone avec un compte de l'application des contrôles. Rôle <b>administrateur</b> ou <b>contributeur</b> : saisie des incidents (un compte dédié, par exemple astreinte@pasly.fr, est conseillé pour le téléphone d'astreinte). Rôle <b>agent</b> ou <b>lecteur</b> : mode signalement, l'agent signale des incidents et voit ceux des autres, sans changer les statuts.</p>
         <label style="display:block;margin-bottom:10px;">Adresse e-mail<input id="srvEmail" type="email" autocomplete="username" value="${esc(email)}" style="width:100%;"></label>
         <label style="display:block;margin-bottom:10px;">Mot de passe<input id="srvPass" type="password" autocomplete="current-password" style="width:100%;"></label>
         <p style="color:var(--text-dim);font-size:.85rem;">Les codes PIN des élus et agents restent inchangés : ils servent toujours à ouvrir l'application.</p>
@@ -986,7 +987,7 @@ async function renderAdminServeur(){
       const pr = await sb.from("profils").select("role, nom").eq("id", data.user.id).maybeSingle();
       const role = pr.data && pr.data.role;
       await kvSet("srvNom", String((pr.data && pr.data.nom || "").trim() || email).slice(0, 80));
-      if(!["admin","contributeur","lecteur"].includes(role)){
+      if(!["admin","contributeur","lecteur","agent"].includes(role)){
         await sb.auth.signOut();
         throw new Error("Ce compte est désactivé ou n'a pas de profil dans l'application des contrôles.");
       }
@@ -995,11 +996,11 @@ async function renderAdminServeur(){
       await kvSet("srvEmail", email); await kvSet("srvRole", role); await kvSet("srvConnected", true);
       state.sync.role = role; state.sync.connected = true;
       // Premier envoi : tous les incidents déjà présents sur ce téléphone (sauf en consultation seule)
-      if(role !== "lecteur"){
+      if(!ROLES_SIGNALEMENT.includes(role)){
         const tous = await incidentAll(), pend = await pendingGet();
         tous.forEach(i => pend.add(i.uuid)); await pendingSave(pend);
       }
-      showToast(role === "lecteur" ? "✅ Téléphone connecté en mode signalement" : "✅ Téléphone connecté au serveur de la mairie");
+      showToast(ROLES_SIGNALEMENT.includes(role) ? "✅ Téléphone connecté en mode signalement" : "✅ Téléphone connecté au serveur de la mairie");
       await syncNow(true);
       renderAdminServeur();
     }catch(e){ showToast(srvErr(e), true); b.disabled = false; }
