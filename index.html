@@ -124,7 +124,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:14px;margin-bottom:12px;}
 .field{margin-bottom:14px;}
 .field label{display:block;font-size:.82rem;color:var(--text-dim);margin-bottom:6px;font-weight:600;}
-input[type=text], input[type=tel], input[type=password], input[type=number], input[type=date], textarea, select{
+input[type=text], input[type=tel], input[type=email], input[type=password], input[type=number], input[type=date], textarea, select{
   width:100%;padding:13px 12px;border-radius:var(--radius-sm);border:1px solid var(--border);
   background:var(--bg-elevated);color:var(--text);font-size:1rem;font-family:inherit;
 }
@@ -458,7 +458,7 @@ function kvSet(key, value){
   })).catch(err => { showToast("Erreur d'enregistrement — réessayez", true); throw err; });
 }
 
-function incidentPut(incident){
+function incidentPutLocal(incident){
   return txStore("incidents","readwrite").then(store => new Promise((resolve,reject) => {
     const r = store.put(incident);
     r.onsuccess = () => resolve(incident);
@@ -485,6 +485,370 @@ function incidentDelete(uuid){
     r.onsuccess = () => resolve(true);
     r.onerror = () => reject(r.error);
   }));
+}
+
+
+/* ============================= SERVEUR DE LA MAIRIE =============================
+   Les incidents restent enregistrés d'abord sur le téléphone (fonctionnement sans
+   réseau inchangé). Quand un compte de l'application des contrôles est connecté,
+   chaque incident est aussi envoyé dans la base mairie-pasly (table
+   astreinte_incidents, photos dans l'espace « astreinte ») et les incidents des
+   autres téléphones sont récupérés. Deux saisies sur le même incident sont
+   fusionnées : l'historique et les photos de chacun sont conservés.
+   ================================================================================ */
+
+const SRV_URL = "https://idswkljjaoajhevgsnfh.supabase.co";
+const SRV_KEY = "sb_publishable_kaRpfQPyPZUKjLkWOEyUTQ_vRKLLU7c";
+const SRV_LIB = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js";
+const APP_CONTROLES = "https://f07303988-hub.github.io/controles-pasly/";
+
+
+let srvLibPromise = null;
+function loadServerLib(){
+  if(window.supabase && window.supabase.createClient) return Promise.resolve();
+  if(srvLibPromise) return srvLibPromise;
+  srvLibPromise = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = SRV_LIB; s.crossOrigin = "anonymous";
+    s.onload = () => resolve();
+    s.onerror = () => { srvLibPromise = null; s.remove(); reject(new Error("Bibliothèque du serveur indisponible (pas de réseau)")); };
+    document.head.appendChild(s);
+  });
+  return srvLibPromise;
+}
+async function srv(){
+  if(state.sync.client) return state.sync.client;
+  await loadServerLib();
+  state.sync.client = window.supabase.createClient(SRV_URL, SRV_KEY, { auth:{ persistSession:true, autoRefreshToken:true, storageKey:"pasly-astreinte-mairie" } });
+  return state.sync.client;
+}
+const srvErr = (e) => {
+  const m = (e && (e.message || e.error_description)) || String(e || "");
+  if(/Invalid login/i.test(m)) return "Adresse e-mail ou mot de passe incorrect";
+  if(/row-level security|permission denied|42501/i.test(m)) return "Ce compte n'a pas le droit d'enregistrer (rôle « lecteur » ou compte désactivé)";
+  if(/Failed to fetch|NetworkError|Load failed|network/i.test(m)) return "Pas de réseau";
+  if(/astreinte_incidents|PGRST205|42P01/i.test(m)) return "La base de la mairie n'est pas encore prête (script migration-astreinte.sql à exécuter)";
+  return m;
+};
+
+/* ---- Liste des incidents à envoyer ---- */
+async function pendingGet(){ return new Set(await kvGet("syncPending", [])); }
+async function pendingSave(set){ await kvSet("syncPending", [...set]); state.sync.pending = set.size; }
+async function pendingAdd(uuid_){ const p = await pendingGet(); p.add(uuid_); await pendingSave(p); }
+
+/* Toute modification passe par ici : horodatage, puis envoi dès que possible */
+const CHAMPS_FUSION_EXCLUS = ["uuid","history","photos","updatedAt","fieldTs","lastSharedAt","travauxId","travauxEnCours"];
+async function incidentPut(incident){
+  const now = new Date().toISOString();
+  // Heure de modification de chaque champ : en cas de saisies sur deux téléphones, chaque champ garde la valeur la plus récente
+  let avant = null; try{ avant = await incidentGet(incident.uuid); }catch(e){}
+  incident.fieldTs = { ...((avant && avant.fieldTs) || {}), ...(incident.fieldTs || {}) };
+  for(const k of Object.keys(incident)){
+    if(CHAMPS_FUSION_EXCLUS.includes(k)) continue;
+    if(!avant || JSON.stringify(avant[k]) !== JSON.stringify(incident[k])) incident.fieldTs[k] = now;
+  }
+  incident.updatedAt = now;
+  await incidentPutLocal(incident);
+  try{ await pendingAdd(incident.uuid); }catch(e){}
+  scheduleSync();
+  return incident;
+}
+
+/* ---- Fusion de deux versions d'un même incident ---- */
+function mergeIncidents(a, b){
+  if(!a) return b; if(!b) return a;
+  const newer = (new Date(a.updatedAt || a.createdAt) >= new Date(b.updatedAt || b.createdAt)) ? a : b;
+  const older = newer === a ? b : a;
+  const out = { ...older, ...newer };
+  const ts = (x, k) => (x.fieldTs && x.fieldTs[k]) || x.createdAt || "";
+  for(const k of new Set([...Object.keys(a), ...Object.keys(b)])){
+    if(CHAMPS_FUSION_EXCLUS.includes(k)) continue;
+    if(!(k in a)) { out[k] = b[k]; continue; }
+    if(!(k in b)) { out[k] = a[k]; continue; }
+    out[k] = ts(a, k) >= ts(b, k) ? a[k] : b[k];
+  }
+  out.fieldTs = {};
+  for(const k of new Set([...Object.keys(a.fieldTs || {}), ...Object.keys(b.fieldTs || {})])) out.fieldTs[k] = [ts(a, k), ts(b, k)].sort().pop();
+  const h = new Map();
+  for(const e of [...(older.history||[]), ...(newer.history||[])]) h.set(e.ts + "|" + e.text, e);
+  out.history = [...h.values()].sort((x, y) => String(x.ts).localeCompare(String(y.ts)));
+  const p = new Map();
+  for(const ph of [...(older.photos||[]), ...(newer.photos||[])]){
+    const k = (ph.phase||"") + "|" + ph.ts, prev = p.get(k) || {};
+    p.set(k, { ...prev, ...ph, dataUrl: ph.dataUrl || prev.dataUrl, chemin: ph.chemin || prev.chemin });
+  }
+  out.photos = [...p.values()].sort((x, y) => String(x.ts).localeCompare(String(y.ts)));
+  out.travauxId = a.travauxId || b.travauxId || null;
+  if(a.lastSharedAt || b.lastSharedAt) out.lastSharedAt = [a.lastSharedAt, b.lastSharedAt].filter(Boolean).sort().pop();
+  out.updatedAt = [a.updatedAt, b.updatedAt, a.createdAt].filter(Boolean).sort().pop();
+  return out;
+}
+function toRow(inc){
+  const donnees = { ...inc, photos:(inc.photos||[]).filter(p => p.chemin).map(p => ({ phase:p.phase, ts:p.ts, chemin:p.chemin })) };
+  return { uuid:inc.uuid, numero:inc.numero || "—", statut:inc.status || "NOUVEAU", urgence:inc.urgency || null, categorie:inc.category || null,
+    adresse:inc.address || null, latitude:inc.lat ?? null, longitude:inc.lng ?? null, donnees,
+    cree_le:inc.createdAt || new Date().toISOString(), maj_le:inc.updatedAt || inc.createdAt || new Date().toISOString(),
+    incident_id:inc.travauxId || null };
+}
+async function dataUrlToBlob(dataUrl){ const r = await fetch(dataUrl); return r.blob(); }
+const dejaStocke = (e) => /already exists|Duplicate|409/i.test((e && (e.message || e.statusCode || e.error)) + "");
+function photoSrc(p){
+  return p.dataUrl || "data:image/svg+xml;utf8," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="#30363d"/><text x="50" y="56" font-size="11" fill="#8b949e" text-anchor="middle" font-family="sans-serif">photo en cours</text></svg>');
+}
+
+/* ---- Synchronisation ---- */
+let syncTimer = null;
+function scheduleSync(delay = 800){
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => { syncNow().catch(()=>{}); }, delay);
+}
+async function syncNow(manual){
+  const S = state.sync;
+  if(S.running){ S.again = true; return; }
+  if(!navigator.onLine){ if(manual) showToast("Pas de réseau : envoi au retour du réseau", true); return; }
+  if(!(await kvGet("srvConnected", false))) return;
+  S.running = true; S.error = null;
+  try{
+    const sb = await srv();
+    const { data:{ session } } = await sb.auth.getSession();
+    if(!session){ S.user = null; S.error = "Session expirée : reconnectez le téléphone dans Administration › Serveur de la mairie"; return; }
+    S.user = session.user;
+    // 1. Envoi des incidents modifiés sur ce téléphone
+    const pend = await pendingGet();
+    for(const id of [...pend]){
+      let inc = await incidentGet(id);
+      if(!inc){ pend.delete(id); continue; }
+      const version = inc.updatedAt;
+      for(const p of inc.photos || []){
+        if(p.chemin || !p.dataUrl) continue;
+        const chemin = `${inc.uuid}/${p.phase || "avant"}-${String(p.ts).replace(/[^0-9]/g, "")}.jpg`;
+        const up = await sb.storage.from("astreinte").upload(chemin, await dataUrlToBlob(p.dataUrl), { contentType:"image/jpeg" });
+        if(up.error && !dejaStocke(up.error)) throw up.error;
+        p.chemin = chemin;
+      }
+      const r = await sb.from("astreinte_incidents").select("donnees").eq("uuid", id).maybeSingle();
+      if(r.error) throw r.error;
+      if(r.data) inc = mergeIncidents(r.data.donnees, inc);
+      let w = await sb.from("astreinte_incidents").upsert(toRow(inc), { onConflict:"uuid" });
+      if(w.error && w.error.code === "23503"){                // incident supprimé entre-temps du suivi des bâtiments
+        inc.travauxId = null; w = await sb.from("astreinte_incidents").upsert(toRow(inc), { onConflict:"uuid" });
+      }
+      if(w.error) throw w.error;
+      const now = await incidentGet(id);
+      if(now && now.updatedAt !== version){ inc = mergeIncidents(inc, now); }   // modifié pendant l'envoi : on garde tout
+      else pend.delete(id);
+      await incidentPutLocal(inc);
+      await pendingSave(pend);
+    }
+    // 2. Réception des incidents des autres téléphones
+    let depuis = await kvGet("srvLastPull", "1970-01-01T00:00:00Z"), plusRecent = depuis;
+    for(;;){
+      const { data, error } = await sb.from("astreinte_incidents").select("uuid, donnees, recu_le").gt("recu_le", depuis).order("recu_le").limit(200);
+      if(error) throw error;
+      for(const row of data){
+        const local = await incidentGet(row.uuid);
+        const fusion = mergeIncidents(local, row.donnees);
+        if(!local || JSON.stringify(fusion) !== JSON.stringify(local)) await incidentPutLocal(fusion);
+        if(row.recu_le > plusRecent) plusRecent = row.recu_le;
+      }
+      if(data.length < 200) break;
+      depuis = data[data.length - 1].recu_le;
+    }
+    // marge d'une minute : un enregistrement validé un peu plus tard n'est jamais manqué
+    if(plusRecent > "1970") await kvSet("srvLastPull", new Date(new Date(plusRecent).getTime() - 60000).toISOString());
+    // 3. Photos des autres téléphones pas encore présentes ici
+    let n = 0;
+    for(const inc of await incidentAll()){
+      let modif = false;
+      for(const p of inc.photos || []){
+        if(p.dataUrl || !p.chemin || n >= 30) continue;
+        const d = await sb.storage.from("astreinte").download(p.chemin);
+        if(d.error) continue;
+        p.dataUrl = await blobToDataURL(d.data); modif = true; n++;
+      }
+      if(modif) await incidentPutLocal(inc);
+    }
+    S.lastOk = new Date().toISOString(); await kvSet("srvLastOk", S.lastOk);
+    S.absent = false;
+  }catch(e){
+    S.error = srvErr(e);
+    if(/pas encore prête/.test(S.error)) S.absent = true;
+    if(manual) showToast(S.error, true);
+  }finally{
+    S.running = false;
+    refreshSyncBadge();
+    if(S.again){ S.again = false; scheduleSync(300); }
+  }
+}
+
+/* ---- Indicateur sur l'accueil ---- */
+function syncBadgeHtml(){
+  const S = state.sync;
+  if(!S.connected) return `<div class="local-badge" id="syncBadge">🟢 Fonctionnement local — données stockées sur cet appareil</div>`;
+  let txt;
+  if(S.error) txt = `🟠 ${esc(S.error)}${S.pending ? ` · ${S.pending} à envoyer` : ""}`;
+  else if(!navigator.onLine) txt = `📴 Hors connexion${S.pending ? ` · ${S.pending} incident${S.pending>1?"s":""} à envoyer au retour du réseau` : ""}`;
+  else if(S.pending || S.running) txt = `🔄 Envoi à la mairie en cours${S.pending ? ` (${S.pending})` : ""}…`;
+  else txt = `🟢 Enregistré à la mairie${S.lastOk ? ` · ${fmtTime(S.lastOk)}` : ""}`;
+  return `<div class="local-badge" id="syncBadge">${txt}</div>`;
+}
+function refreshSyncBadge(){
+  const b = document.getElementById("syncBadge");
+  if(b) b.outerHTML = syncBadgeHtml();
+}
+async function initSync(){
+  state.sync = { client:null, user:null, pending:0, lastOk:null, error:null, running:false, again:false, absent:false, connected:false };
+  state.sync.connected = await kvGet("srvConnected", false);
+  state.sync.lastOk = await kvGet("srvLastOk", null);
+  state.sync.pending = (await pendingGet()).size;
+  if(state.sync.connected){ scheduleSync(300); setInterval(() => scheduleSync(0), 120000); }
+  window.addEventListener("online", () => scheduleSync(500));
+  document.addEventListener("visibilitychange", () => { if(!document.hidden) scheduleSync(500); });
+}
+
+/* ---- Administration › Serveur de la mairie ---- */
+async function renderAdminServeur(){
+  const S = state.sync, connecte = await kvGet("srvConnected", false), email = await kvGet("srvEmail", "");
+  app.innerHTML = `
+    ${topbar("Serveur de la mairie", "admin")}
+    <div class="card">
+      <p style="margin-top:0;">Les incidents sont envoyés dans la base de la mairie (application des contrôles des bâtiments) : rien n'est perdu si le téléphone l'est, et les incidents sont partagés entre les téléphones d'astreinte. Sans réseau, l'application fonctionne comme avant ; l'envoi se fait au retour du réseau.</p>
+    </div>
+    ${connecte ? `
+      <div class="card">
+        <p style="margin:0;"><b>Connecté</b> avec le compte <b>${esc(email)}</b></p>
+        <p style="color:var(--text-dim);margin:8px 0 0;">${S.lastOk ? `Dernier échange : ${fmtDateTime(S.lastOk)}` : "Aucun échange pour le moment"}${S.pending ? ` · ${S.pending} incident${S.pending>1?"s":""} à envoyer` : ""}</p>
+        ${S.error ? `<p style="color:var(--urgent);margin:8px 0 0;font-weight:700;">${esc(S.error)}</p>` : ""}
+      </div>
+      <button class="big-btn primary" id="srvSync"><span class="ic">🔄</span><span class="lbl">Synchroniser maintenant</span></button>
+      <button class="big-btn secondary" id="srvLogout"><span class="ic">⏏️</span><span class="lbl">Déconnecter ce téléphone</span></button>
+    ` : `
+      <div class="card">
+        <p style="margin-top:0;">Connectez ce téléphone avec un compte de l'application des contrôles ayant le rôle <b>administrateur</b> ou <b>contributeur</b>. Un compte dédié à l'astreinte (par exemple astreinte@pasly.fr) est conseillé.</p>
+        <label style="display:block;margin-bottom:10px;">Adresse e-mail<input id="srvEmail" type="email" autocomplete="username" value="${esc(email)}" style="width:100%;"></label>
+        <label style="display:block;margin-bottom:10px;">Mot de passe<input id="srvPass" type="password" autocomplete="current-password" style="width:100%;"></label>
+        <p style="color:var(--text-dim);font-size:.85rem;">Les codes PIN des élus et agents restent inchangés : ils servent toujours à ouvrir l'application.</p>
+      </div>
+      <button class="big-btn primary" id="srvLogin"><span class="ic">🔗</span><span class="lbl">Connecter</span></button>
+    `}
+  `;
+  const by = (id) => document.getElementById(id);
+  if(by("srvSync")) by("srvSync").addEventListener("click", async () => { await syncNow(true); if(!state.sync.error) showToast("✅ Synchronisé"); renderAdminServeur(); });
+  if(by("srvLogout")) by("srvLogout").addEventListener("click", async () => {
+    const n = (await pendingGet()).size;
+    if(!confirm(n ? `${n} incident(s) n'ont pas encore été envoyés. Ils restent sur ce téléphone et partiront si vous le reconnectez. Déconnecter ?` : "Déconnecter ce téléphone du serveur de la mairie ? Les incidents restent sur le téléphone.")) return;
+    try{ const sb = await srv(); await sb.auth.signOut(); }catch(e){}
+    await kvSet("srvConnected", false); state.sync.connected = false; state.sync.error = null;
+    showToast("Téléphone déconnecté du serveur"); renderAdminServeur();
+  });
+  if(by("srvLogin")) by("srvLogin").addEventListener("click", async () => {
+    const email = by("srvEmail").value.trim(), pass = by("srvPass").value;
+    if(!email || !pass) return showToast("Saisissez l'adresse e-mail et le mot de passe", true);
+    if(!navigator.onLine) return showToast("Pas de réseau : la connexion demande Internet", true);
+    const b = by("srvLogin"); b.disabled = true;
+    try{
+      const sb = await srv();
+      const { data, error } = await sb.auth.signInWithPassword({ email, password:pass });
+      if(error) throw error;
+      const pr = await sb.from("profils").select("role").eq("id", data.user.id).maybeSingle();
+      const role = pr.data && pr.data.role;
+      if(!["admin","contributeur"].includes(role)){
+        await sb.auth.signOut();
+        throw new Error(role ? "Ce compte a le rôle « lecteur » : donnez-lui le rôle contributeur dans l'application des contrôles (Compte › Utilisateurs)." : "Ce compte est désactivé ou n'a pas de profil dans l'application des contrôles.");
+      }
+      const t = await sb.from("astreinte_incidents").select("uuid").limit(1);
+      if(t.error){ await sb.auth.signOut(); throw t.error; }
+      await kvSet("srvEmail", email); await kvSet("srvConnected", true); state.sync.connected = true;
+      // Premier envoi : tous les incidents déjà présents sur ce téléphone
+      const tous = await incidentAll(), pend = await pendingGet();
+      tous.forEach(i => pend.add(i.uuid)); await pendingSave(pend);
+      showToast("✅ Téléphone connecté au serveur de la mairie");
+      await syncNow(true);
+      renderAdminServeur();
+    }catch(e){ showToast(srvErr(e), true); b.disabled = false; }
+  });
+}
+
+/* ---- Transmission d'un incident au suivi des bâtiments (module Travaux › Incidents) ---- */
+const CAT_TRAVAUX = { eau:"plomberie", eclairage:"electricite", incendie:"securite", danger:"securite", arbre:"espaces_exterieurs",
+  voirie:"espaces_exterieurs", stade:"espaces_exterieurs", inondation:"espaces_exterieurs", proprete:"nettoyage", stationnement:"autre", batiment:"autre", autre:"autre" };
+const PRIO_TRAVAUX = { IMMEDIATE:"urgente", URGENT:"haute", A_TRAITER:"normale", INFO:"basse" };
+const STATUT_TRAVAUX = { NOUVEAU:"nouveau", PRIS_EN_CHARGE:"a_traiter", EN_COURS:"en_cours", PROGRAMMEE:"attente_prestataire", RESOLU:"resolu", ARCHIVE:"resolu" };
+
+function travauxCardHtml(incident){
+  if(!state.sync.connected) return "";
+  if(incident.travauxId) return `<div class="card"><p style="margin:0;">🏗️ <b>Transmis au suivi des bâtiments</b></p>
+    <p style="color:var(--text-dim);margin:6px 0 0;">Le suivi (devis, intervention, clôture) se fait dans l'application des contrôles, onglet Travaux.</p>
+    <a class="link-btn" href="${APP_CONTROLES}" target="_blank" rel="noopener">Ouvrir l'application des contrôles</a></div>`;
+  return `<button class="big-btn secondary" id="travauxBtn"><span class="ic">🏗️</span><span class="lbl">Transmettre au suivi des bâtiments</span></button>`;
+}
+async function openTravauxOverlay(incident){
+  if(!navigator.onLine) return showToast("Pas de réseau : la transmission demande Internet", true);
+  let sites = [];
+  try{
+    const sb = await srv();
+    const r = await sb.from("sites").select("id, nom, actif").order("ordre").order("nom");
+    if(r.error) throw r.error;
+    sites = (r.data || []).filter(s => s.actif !== false);
+  }catch(e){ return showToast(srvErr(e), true); }
+  if(!sites.length) return showToast("Aucun bâtiment dans l'application des contrôles", true);
+  const cat = catInfo(incident.category);
+  const titre = (incident.description || "").split(/\n/)[0].slice(0, 90) || `${cat.label} – ${incident.address || incident.numero}`;
+  const overlay = document.createElement("div");
+  overlay.className = "sms-overlay";
+  overlay.innerHTML = `<div class="sms-modal">
+    <h3 style="margin-bottom:6px;">Transmettre au suivi des bâtiments</h3>
+    <p style="color:var(--text-dim);">L'incident sera créé dans l'application des contrôles (onglet Travaux › Incidents), avec ses photos, pour la suite : devis, entreprise, réparation.</p>
+    <label style="display:block;margin-bottom:10px;">Bâtiment ou lieu<select id="trSite" style="width:100%;">${sites.map(s => `<option value="${esc(s.id)}">${esc(s.nom)}</option>`).join("")}</select></label>
+    <label style="display:block;margin-bottom:10px;">Titre<input id="trTitre" type="text" value="${esc(titre)}" style="width:100%;"></label>
+    <button class="big-btn primary" id="trOk"><span class="ic">🏗️</span><span class="lbl">Transmettre</span></button>
+    <button class="ghost-full" id="trCancel">Annuler</button></div>`;
+  document.body.appendChild(overlay);
+  overlay.addEventListener("click", (e) => { if(e.target === overlay) overlay.remove(); });
+  overlay.querySelector("#trCancel").addEventListener("click", () => overlay.remove());
+  overlay.querySelector("#trOk").addEventListener("click", async () => {
+    const btn = overlay.querySelector("#trOk"); btn.disabled = true;
+    const titreF = overlay.querySelector("#trTitre").value.trim();
+    if(!titreF){ btn.disabled = false; return showToast("Le titre est obligatoire", true); }
+    try{
+      const sb = await srv();
+      const inc = await incidentGet(incident.uuid);
+      inc.travauxEnCours ||= uuid();                     // identifiant fixé : une nouvelle tentative ne crée pas de doublon
+      await incidentPutLocal(inc);
+      const id = inc.travauxEnCours, st = STATUT_TRAVAUX[inc.status] || "nouveau";
+      const desc = [inc.description, inc.address ? `Lieu : ${inc.address}` : "", inc.lat != null ? `GPS : ${inc.lat.toFixed(6)}, ${inc.lng.toFixed(6)}` : "",
+        `Transmis depuis l'astreinte (incident ${inc.numero}, ${catInfo(inc.category).label}, ${urgencyInfo(inc.urgency).label}).`].filter(Boolean).join("\n");
+      const ligne = { id, site_id:overlay.querySelector("#trSite").value, titre:titreF, description:desc, categorie:CAT_TRAVAUX[inc.category] || "autre",
+        priorite:PRIO_TRAVAUX[inc.urgency] || "normale", statut:st, date_signalement:(inc.createdAt || new Date().toISOString()).slice(0, 10),
+        signale_par:inc.reporterName || inc.createdBy || state.currentUser || null,
+        ...(st === "resolu" ? { date_resolution:new Date().toISOString().slice(0, 10) } : {}) };
+      const ins = await sb.from("incidents").insert(ligne);
+      if(ins.error){
+        const v = await sb.from("incidents").select("id").eq("id", id).maybeSingle();
+        if(v.error || !v.data) throw ins.error;          // réponse perdue mais incident bien créé : on continue
+      }
+      let k = 0;
+      for(const p of inc.photos || []){
+        if(!p.dataUrl) continue;
+        k++;
+        const chemin = `${id}/astreinte-${String(p.ts).replace(/[^0-9]/g, "")}.jpg`;
+        const up = await sb.storage.from("incidents").upload(chemin, await dataUrlToBlob(p.dataUrl), { contentType:"image/jpeg" });
+        if(up.error && !dejaStocke(up.error)) throw up.error;
+        const ex = await sb.from("incident_documents").select("id").eq("incident_id", id).eq("chemin", chemin).maybeSingle();
+        if(!ex.data){
+          const d = await sb.from("incident_documents").insert({ incident_id:id, chemin, nom:`Photo astreinte ${k}.jpg`, mime:"image/jpeg",
+            type:p.phase === "apres" ? "photo_intervention" : "photo_signalement" });
+          if(d.error) throw d.error;
+        }
+      }
+      inc.travauxId = id; delete inc.travauxEnCours;
+      inc.history.push({ ts:new Date().toISOString(), text:`🏗️ Transmis au suivi des bâtiments${state.currentUser ? ` · par ${state.currentUser}` : ""}` });
+      await incidentPut(inc);
+      overlay.remove();
+      showToast("✅ Transmis au suivi des bâtiments");
+      renderFiche({ uuid:inc.uuid });
+    }catch(e){ btn.disabled = false; showToast("Transmission impossible : " + srvErr(e), true); }
+  });
 }
 
 /* ============================= UTILITAIRES ============================= */
@@ -706,6 +1070,7 @@ async function render(){
     case "admin-securite": return renderAdminSecurite();
     case "admin-sauvegarde": return renderAdminSauvegarde();
     case "admin-commune": return renderAdminCommune();
+    case "admin-serveur": return renderAdminServeur();
     default: return renderHome();
   }
 }
@@ -887,7 +1252,7 @@ async function renderHome(){
       <div class="badge-icon">🚨</div>
       <h1>PASLY ASTREINTE</h1>
       <p class="subtitle">Gestion des incidents municipaux</p>
-      <div class="local-badge">🟢 Fonctionnement local — données stockées sur cet appareil</div>
+      ${syncBadgeHtml()}
       ${state.currentUser ? `<div class="duty-badge"><span class="db-label">👤 Astreinte actuelle</span><span class="db-name">${esc(state.currentUser)}</span></div>` : `<button class="link-btn" id="chooseInitialUser">Qui prend l'astreinte ?</button>`}
     </div>
 
@@ -1380,13 +1745,13 @@ async function renderFiche(params){
       <div class="row">
         <button class="ghost-full" id="addBefore">📷 Ajouter une photo</button>
       </div>
-      <div class="photo-grid">${beforePhotos.map(p=>`<img src="${p.dataUrl}">`).join("")}</div>
+      <div class="photo-grid">${beforePhotos.map(p=>`<img src="${photoSrc(p)}">`).join("")}</div>
 
       <div class="section-title">Photos après intervention</div>
       <div class="row">
         <button class="ghost-full" id="addAfter">📷 Ajouter photo après intervention</button>
       </div>
-      <div class="photo-grid">${afterPhotos.map(p=>`<img src="${p.dataUrl}">`).join("")}</div>
+      <div class="photo-grid">${afterPhotos.map(p=>`<img src="${photoSrc(p)}">`).join("")}</div>
     </div>
 
     <div class="section-title">Historique</div>
@@ -1394,6 +1759,7 @@ async function renderFiche(params){
       ${incident.history.map(h=>`<div class="history-item"><span class="t">${fmtTime(h.ts)}</span><span>${esc(h.text)}</span></div>`).join("")}
     </div>
 
+    ${travauxCardHtml(incident)}
     <button class="ghost-full" id="emailMairie">✉️ Informer la mairie</button>
     <button class="ghost-full" id="exportPdf">📄 Exporter en PDF</button>
     <input type="file" id="beforeInput" accept="image/*" multiple style="display:none;">
@@ -1410,6 +1776,8 @@ async function renderFiche(params){
   document.getElementById("afterInput").addEventListener("change", e=>addPhotosToIncident(incident.uuid, e.target.files, "apres", params));
   document.getElementById("exportPdf").addEventListener("click", ()=>exportIncidentPdf(incident));
   document.getElementById("emailMairie").addEventListener("click", ()=>emailIncidentToMairie(incident));
+  const travauxBtn = document.getElementById("travauxBtn");
+  if(travauxBtn) travauxBtn.addEventListener("click", ()=>openTravauxOverlay(incident));
   document.getElementById("smsAlertBtn").addEventListener("click", ()=>openSmsRecipientModal(incident));
   document.getElementById("smsShareBtn").addEventListener("click", ()=>shareIncidentNative(incident));
 }
@@ -1562,7 +1930,7 @@ async function shareIncidentNative(incident){
     try{
       if(incident.photos && incident.photos.length && navigator.canShare){
         const files = (await Promise.all(
-          incident.photos.slice(0, 5).map((p,i)=>dataUrlToFile(p.dataUrl, `photo-${i+1}.jpg`))
+          incident.photos.filter(p=>p.dataUrl).slice(0, 5).map((p,i)=>dataUrlToFile(p.dataUrl, `photo-${i+1}.jpg`))
         )).filter(Boolean);
         if(files.length && navigator.canShare({files})){ shareData.files = files; }
       }
@@ -1767,7 +2135,7 @@ function exportIncidentPdf(incident){
     <p><b>Signalé par :</b> ${esc(incident.reporterName) || "—"} ${incident.reporterPhone ? '('+esc(incident.reporterPhone)+')' : ""}</p>
     <h3>Photos</h3>
     <div style="display:flex;flex-wrap:wrap;gap:8px;">
-      ${incident.photos.map(p=>`<img src="${p.dataUrl}" style="width:150px;height:150px;object-fit:cover;">`).join("") || "<p>Aucune</p>"}
+      ${incident.photos.map(p=>`<img src="${photoSrc(p)}" style="width:150px;height:150px;object-fit:cover;">`).join("") || "<p>Aucune</p>"}
     </div>
     <h3>Historique</h3>
     ${incident.history.map(h=>`<p style="margin:2px 0;">${fmtDateTime(h.ts)} — ${esc(h.text)}</p>`).join("")}
@@ -2104,6 +2472,7 @@ function renderAdminHome(){
     <button class="big-btn" data-nav="admin-consignes"><span class="ic">📖</span><span class="lbl">Consignes</span></button>
     <button class="big-btn" data-nav="admin-users"><span class="ic">👤</span><span class="lbl">Utilisateurs</span></button>
     <button class="big-btn" data-nav="admin-securite"><span class="ic">🔐</span><span class="lbl">Sécurité (codes PIN)</span></button>
+    <button class="big-btn" data-nav="admin-serveur"><span class="ic">🔗</span><span class="lbl">Serveur de la mairie</span></button>
     <button class="big-btn" data-nav="admin-sauvegarde"><span class="ic">💾</span><span class="lbl">Sauvegarde</span></button>
   `;
 }
@@ -2460,6 +2829,7 @@ async function init(){
     await ensurePins();
     await ensureUsers();
     await loadConfig();
+    await initSync();
   }catch(e){
     document.getElementById("app").innerHTML = "<p style='padding:24px;'>Erreur d'initialisation de l'application. Rechargez la page.</p>";
     return;

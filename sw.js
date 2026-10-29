@@ -3,7 +3,7 @@
 // bibliothèque cartographique (Leaflet) et des tuiles OpenStreetMap déjà
 // consultées, pour que la carte reste utilisable hors connexion sur les
 // zones déjà visitées.
-const CACHE_NAME = "pasly-astreinte-v2";
+const CACHE_NAME = "pasly-astreinte-v3";
 const SHELL_FILES = [
   "./index.html",
   "./manifest.json",
@@ -49,6 +49,10 @@ function isMapTile(url){
 function isMapLib(url){
   return url.hostname === "cdnjs.cloudflare.com" && url.pathname.includes("/leaflet/");
 }
+// Bibliothèque de connexion au serveur de la mairie (version figée) : gardée en cache
+function isServerLib(url){
+  return url.hostname === "cdn.jsdelivr.net" && url.pathname.startsWith("/npm/@supabase/supabase-js@2.45.4/");
+}
 
 self.addEventListener("fetch", (event) => {
   const req = event.request;
@@ -59,7 +63,7 @@ self.addEventListener("fetch", (event) => {
 
   // Ressources externes non liées à la carte (ex: liens "Itinéraire" vers
   // Google Maps) : réseau normal, jamais interceptées ni mises en cache.
-  if (!sameOrigin && !isMapTile(url) && !isMapLib(url)) return;
+  if (!sameOrigin && !isMapTile(url) && !isMapLib(url) && !isServerLib(url)) return;
 
   // Cache-first avec mise à jour en arrière-plan pour l'app shell, la lib
   // carto et les tuiles déjà vues (fonctionne aussi pour les réponses
