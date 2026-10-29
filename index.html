@@ -685,6 +685,8 @@ async function syncNow(manual){
     }
     // 1 bis. Réglages communs (catégories, numéros utiles, consignes, commune)
     await syncConfig(sb);
+    // 1 ter. Qui est d'astreinte d'après le planning (au plus toutes les 15 minutes)
+    try{ await syncPlanning(sb); }catch(e){}
     // 2. Réception des incidents des autres téléphones
     let depuis = await kvGet("srvLastPull", "1970-01-01T00:00:00Z"), plusRecent = depuis;
     for(;;){
@@ -781,6 +783,51 @@ async function syncConfig(sb){
   }
 }
 
+/* ---- Astreinte en cours d'après le planning des astreintes ---- */
+async function syncPlanning(sb, force){
+  const dernier = await kvGet("planningRecuLe", 0);
+  if(!force && Date.now() - dernier < 15 * 60000) return;
+  const r = await sb.from("parametres").select("valeur").eq("cle", "planning_astreinte").maybeSingle();
+  const cfg = r.data && r.data.valeur;
+  if(r.error || !cfg || typeof cfg.url !== "string" || !/^https:\/\/[a-z0-9]+\.supabase\.co\/functions\/v1\/[a-z0-9-]+$/.test(cfg.url) || !/^[0-9a-f]{48}$/.test(cfg.jeton || "")) return;
+  const res = await fetch(cfg.url + "?t=" + cfg.jeton, { cache:"no-store" });
+  if(!res.ok) throw new Error("Planning indisponible (" + res.status + ")");
+  const d = await res.json();
+  const agent = (a) => (a && typeof a === "object" && typeof a.nom === "string") ? { nom:String(a.nom).slice(0, 80), telephone:typeof a.telephone === "string" ? a.telephone.replace(/[^0-9+ ().-]/g, "").slice(0, 25) : null, remplace:typeof a.remplace === "string" ? String(a.remplace).slice(0, 80) : null } : null;
+  const date = (x) => (typeof x === "string" && /^\d{4}-\d{2}-\d{2}$/.test(x)) ? x : null;
+  const sem = (x) => (x && typeof x === "object") ? { debut:date(x.debut), fin:date(x.fin), titulaire:agent(x.titulaire) } : null;
+  const propre = { jour:date(d.jour), aujourdhui:agent(d.aujourdhui), semaine:sem(d.semaine), suivante:sem(d.suivante), demain:agent(d.demain_remplacement) };
+  await kvSetBrut("planningAstreinte", propre); await kvSetBrut("planningRecuLe", Date.now());
+  state.planning = propre;
+  if(parseHash().route === "home" && state.unlocked) renderHome();
+}
+const memeNom = (a, b) => {
+  const mots = (x) => String(x || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase().split(/[^A-Z0-9]+/).filter(w => w.length > 1);
+  const A = mots(a), B = mots(b);
+  return A.length > 0 && B.length > 0 && (A.every(w => B.includes(w)) || B.every(w => A.includes(w)));
+};
+const jourCourt = (iso) => iso ? new Date(iso + "T12:00:00").toLocaleDateString("fr-FR", { weekday:"short", day:"numeric", month:"short" }) : "";
+function planningCardHtml(){
+  const P = state.planning;
+  if(!state.sync || !state.sync.connected || !P || !P.aujourdhui) return "";
+  const a = P.aujourdhui, tel = a.telephone ? a.telephone.replace(/\s+/g, "") : "";
+  const decalage = state.currentUser && !memeNom(state.currentUser, a.nom);
+  const auj = new Date().toLocaleDateString("sv-SE");
+  const perime = P.jour && P.jour !== auj;
+  let h = `<div class="card" style="margin-bottom:12px;">
+    <p style="margin:0;font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;color:var(--text-dim);font-weight:750;">📅 D'astreinte selon le planning${perime ? " (données du " + esc(jourCourt(P.jour)) + ")" : ""}</p>
+    <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
+      <div style="flex:1;"><b style="font-size:1.05rem;">${esc(a.nom)}</b>
+        ${a.remplace ? `<div style="color:var(--text-dim);font-size:.85rem;">aujourd'hui, en remplacement de ${esc(a.remplace)}</div>` : (P.semaine && P.semaine.fin ? `<div style="color:var(--text-dim);font-size:.85rem;">jusqu'au ${esc(jourCourt(P.semaine.fin))}</div>` : "")}</div>
+      ${tel ? `<a class="call-btn" href="tel:${esc(tel)}">📞 Appeler</a>` : ""}
+    </div>`;
+  if(P.demain && P.demain.nom) h += `<p style="margin:8px 0 0;color:var(--text-dim);font-size:.85rem;">Demain : ${esc(P.demain.nom)}${P.demain.remplace ? ` remplace ${esc(P.demain.remplace)}` : ""}</p>`;
+  else if(P.suivante && P.suivante.titulaire && P.suivante.debut) h += `<p style="margin:8px 0 0;color:var(--text-dim);font-size:.85rem;">À partir du ${esc(jourCourt(P.suivante.debut))} : ${esc(P.suivante.titulaire.nom)}</p>`;
+  if(decalage) h += `<p style="margin:10px 0 0;color:var(--urgent);font-weight:700;font-size:.88rem;">Ce téléphone est au nom de ${esc(state.currentUser)}.</p>
+    <button class="ghost-full" data-nav="passation" style="margin-top:6px;">🔄 Faire la passation</button>`;
+  return h + `</div>`;
+}
+
 /* ---- Indicateur sur l'accueil ---- */
 function syncBadgeHtml(){
   const S = state.sync;
@@ -797,6 +844,7 @@ function refreshSyncBadge(){
   if(b) b.outerHTML = syncBadgeHtml();
 }
 async function initSync(){
+  try{ state.planning = await kvGet("planningAstreinte", null); }catch(e){}
   state.sync = { client:null, user:null, pending:0, lastOk:null, error:null, running:false, again:false, absent:false, connected:false };
   state.sync.connected = await kvGet("srvConnected", false);
   state.sync.lastOk = await kvGet("srvLastOk", null);
@@ -1374,6 +1422,8 @@ async function renderHome(){
       ${syncBadgeHtml()}
       ${state.currentUser ? `<div class="duty-badge"><span class="db-label">👤 Astreinte actuelle</span><span class="db-name">${esc(state.currentUser)}</span></div>` : `<button class="link-btn" id="chooseInitialUser">Qui prend l'astreinte ?</button>`}
     </div>
+
+    ${planningCardHtml()}
 
     ${banner}
 
