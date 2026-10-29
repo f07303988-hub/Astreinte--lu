@@ -537,7 +537,8 @@ async function srv(){
 const srvErr = (e) => {
   const m = (e && (e.message || e.error_description)) || String(e || "");
   if(/Invalid login/i.test(m)) return "Adresse e-mail ou mot de passe incorrect";
-  if(/row-level security|permission denied|42501/i.test(m)) return "Ce compte n'a pas le droit d'enregistrer (rôle « lecteur » ou compte désactivé)";
+  if(/row-level security|permission denied|42501/i.test(m)) return "Ce compte n'a pas le droit de faire cette modification (rôle ou compte désactivé)";
+  if(/Mode signalement/i.test(m)) return m.replace(/^.*?(Mode signalement)/, "$1");
   if(/Failed to fetch|NetworkError|Load failed|network/i.test(m)) return "Pas de réseau";
   if(/astreinte_incidents|PGRST205|42P01/i.test(m)) return "La base de la mairie n'est pas encore prête (script migration-astreinte.sql à exécuter)";
   return m;
@@ -670,6 +671,11 @@ async function syncNow(manual){
     const { data:{ session } } = await sb.auth.getSession();
     if(!session){ S.user = null; S.error = "Session expirée : reconnectez le téléphone dans Administration › Serveur de la mairie"; return; }
     S.user = session.user;
+    // 0 bis. Nouveau compte sur ce téléphone : les signalements de l'ancien ne sont plus « les miens »
+    if((await kvGet("mesSignalementsCompte", null)) !== session.user.id){
+      state.mesSignalements = new Set(); await kvSetBrut("mesSignalements", []);
+      await kvSetBrut("mesSignalementsCompte", session.user.id); await kvSetBrut("srvLastPull", "1970-01-01T00:00:00Z");
+    }
     // 0. Rôle du compte (il peut avoir changé dans l'application des contrôles)
     const pr = await sb.from("profils").select("role, nom").eq("id", session.user.id).maybeSingle();
     if(pr.error) throw pr.error;
@@ -686,7 +692,9 @@ async function syncNow(manual){
     }
     // 1. Envoi des incidents modifiés sur ce téléphone (pas en consultation seule)
     const pend = await pendingGet();
+    let refusees = 0;
     for(const id of [...pend].filter(i => !modeSignalement() || estMonSignalement(i))){
+     try{
       let inc = await incidentGet(id);
       if(!inc){ pend.delete(id); continue; }
       const version = inc.updatedAt;
@@ -710,7 +718,16 @@ async function syncNow(manual){
       else pend.delete(id);
       await incidentPutLocal(inc);
       await pendingSave(pend);
+     }catch(e){
+      // Refus définitif (droits, règle de la base) : on retire l'envoi et on reprend la version de la mairie.
+      // Une erreur de réseau, elle, interrompt l'échange et sera réessayée.
+      if(!["42501","P0001","23514","22P02"].includes(e && e.code)) throw e;
+      refusees++; pend.delete(id); await pendingSave(pend);
+      const r = await sb.from("astreinte_incidents").select("donnees").eq("uuid", id).maybeSingle();
+      if(r.data) await incidentPutLocal(nettoyerDistant(r.data.donnees, id));
+     }
     }
+    if(refusees) showToast(`${refusees} modification${refusees > 1 ? "s refusées" : " refusée"} par la mairie (droits insuffisants)`, true);
     // 1 bis. Réglages communs (catégories, numéros utiles, consignes, commune)
     await syncConfig(sb);
     // 1 ter. Qui est d'astreinte d'après le planning (au plus toutes les 15 minutes)
@@ -718,14 +735,17 @@ async function syncNow(manual){
     // 2. Réception des incidents des autres téléphones
     let depuis = await kvGet("srvLastPull", "1970-01-01T00:00:00Z"), plusRecent = depuis;
     for(;;){
-      const { data, error } = await sb.from("astreinte_incidents").select("uuid, donnees, recu_le").gt("recu_le", depuis).order("recu_le").limit(200);
+      const { data, error } = await sb.from("astreinte_incidents").select("uuid, donnees, recu_le, cree_par").gt("recu_le", depuis).order("recu_le").limit(200);
       if(error) throw error;
+      let mesAjouts = false;
       for(const row of data){
+        if(modeSignalement() && row.cree_par === session.user.id && !estMonSignalement(row.uuid)){ state.mesSignalements.add(row.uuid); mesAjouts = true; }
         const local = await incidentGet(row.uuid);
         const fusion = mergeIncidents(local, nettoyerDistant(row.donnees, row.uuid));
         if(!local || JSON.stringify(fusion) !== JSON.stringify(local)) await incidentPutLocal(fusion);
         if(row.recu_le > plusRecent) plusRecent = row.recu_le;
       }
+      if(mesAjouts) await kvSetBrut("mesSignalements", [...state.mesSignalements]);
       if(data.length < 200) break;
       depuis = data[data.length - 1].recu_le;
     }
@@ -909,6 +929,10 @@ async function connecterAgent(email, pass){
   await kvSet("srvEmail", email); await kvSet("srvRole", role); await kvSet("srvNom", nom); await kvSet("srvConnected", true);
   state.sync.role = role; state.sync.connected = true; state.sync.error = null;
   state.unlocked = true; state.currentUser = nom;
+  if((await kvGet("mesSignalementsCompte", null)) !== data.user.id){
+    state.mesSignalements = new Set(); await kvSetBrut("mesSignalements", []);
+    await kvSetBrut("mesSignalementsCompte", data.user.id); await kvSetBrut("srvLastPull", "1970-01-01T00:00:00Z");
+  }
   if(!state.syncTimerOn){ state.syncTimerOn = true; setInterval(() => scheduleSync(0), 120000); }
   syncNow().catch(()=>{});
 }
@@ -1975,14 +1999,19 @@ async function renderIncidentConfirm(params){
     <button class="big-btn" data-nav="numeros" data-params='{"category":"${incident.category}"}'><span class="ic">📞</span><span class="lbl">Contacter</span></button>
     <button class="big-btn" id="seePos"><span class="ic">🗺️</span><span class="lbl">Voir la position</span></button>
     <button class="big-btn" data-nav="fiche" data-params='{"uuid":"${incident.uuid}"}'><span class="ic">📷</span><span class="lbl">Ajouter une photo</span></button>
-    <button class="big-btn" id="takeCharge"><span class="ic">▶️</span><span class="lbl">Prendre en charge</span></button>
+    ${modeSignalement()
+      ? (state.planning && state.planning.aujourdhui && state.planning.aujourdhui.telephone
+          ? `<a class="big-btn primary" href="tel:${esc(state.planning.aujourdhui.telephone.replace(/\s+/g, ""))}"><span class="ic">📞</span><span class="lbl">Prévenir l'astreinte (${esc(state.planning.aujourdhui.nom)})</span></a>
+             <p style="color:var(--text-dim);font-size:.85rem;margin:-4px 0 10px;">Le signalement apparaît sur le téléphone d'astreinte, mais il ne sonne pas : appelez si c'est urgent.</p>`
+          : `<p style="color:var(--text-dim);font-size:.9rem;">Le téléphone d'astreinte ne sonne pas : appelez-le si c'est urgent.</p>`)
+      : `<button class="big-btn" id="takeCharge"><span class="ic">▶️</span><span class="lbl">Prendre en charge</span></button>`}
     <button class="ghost-full" data-nav="home">Retour à l'accueil</button>
   `;
   document.getElementById("seePos").addEventListener("click", ()=>{
     if(incident.lat){ window.open(`https://www.google.com/maps?q=${incident.lat},${incident.lng}`, "_blank"); }
     else { showToast("Aucune position GPS enregistrée", true); }
   });
-  document.getElementById("takeCharge").addEventListener("click", async ()=>{
+  if(document.getElementById("takeCharge")) document.getElementById("takeCharge").addEventListener("click", async ()=>{
     await changeIncidentStatus(incident.uuid, "PRIS_EN_CHARGE");
     showToast("Incident pris en charge");
     nav("fiche", {uuid: incident.uuid});
@@ -3243,10 +3272,17 @@ async function init(){
     // Mise à jour automatique : dès qu'une nouvelle version est installée, la page se recharge une fois
     const avaitVersion = !!navigator.serviceWorker.controller;
     let recharge = false;
+    const rechargerSiPossible = () => {
+      const { route } = parseHash();
+      if(["nouvel-incident","passation"].includes(route) || route.startsWith("admin-") || document.querySelector(".sms-overlay, .sms-modal")) return false;
+      recharge = true; location.reload(); return true;
+    };
+    let miseAJourEnAttente = false;
     navigator.serviceWorker.addEventListener("controllerchange", () => {
       if(!avaitVersion || recharge) return;
-      recharge = true; location.reload();
+      if(!rechargerSiPossible()) miseAJourEnAttente = true;     // saisie en cours : on attend la fin
     });
+    window.addEventListener("hashchange", () => { if(miseAJourEnAttente && !recharge) rechargerSiPossible(); });
     navigator.serviceWorker.register("./sw.js").then(reg => {
       document.addEventListener("visibilitychange", () => { if(!document.hidden) reg.update().catch(()=>{}); });
     }).catch(()=>{});
