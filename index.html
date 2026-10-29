@@ -554,6 +554,37 @@ async function incidentPut(incident){
   return incident;
 }
 
+/* ---- Données reçues du serveur : seuls les champs et formats attendus sont gardés ---- */
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T[0-9:.]+(Z|[+-]\d{2}:?\d{2})?$/;
+function nettoyerDistant(d, uuidColonne){
+  d = (d && typeof d === "object") ? d : {};
+  const txt = (v, max = 4000) => (v === null || v === undefined) ? "" : String(v).slice(0, max);
+  const date = (v) => (typeof v === "string" && ISO_RE.test(v)) ? v : null;
+  const num = (v, a, b) => (typeof v === "number" && isFinite(v) && v >= a && v <= b) ? v : null;
+  const ids = (l) => new Set(l.map(x => x.id));
+  const out = {
+    uuid: uuidColonne,
+    numero: txt(d.numero, 60) || "—",
+    category: /^[a-z0-9_-]{1,40}$/i.test(d.category || "") ? d.category : "autre",
+    urgency: ids(URGENCIES).has(d.urgency) ? d.urgency : "A_TRAITER",
+    status: ids(STATUSES).has(d.status) ? d.status : "NOUVEAU",
+    lat: num(d.lat, -90, 90), lng: num(d.lng, -180, 180),
+    address: txt(d.address, 300), description: txt(d.description),
+    reporterName: txt(d.reporterName, 120), reporterPhone: txt(d.reporterPhone, 40), reporterComment: txt(d.reporterComment),
+    createdAt: date(d.createdAt) || new Date(0).toISOString(), createdBy: d.createdBy ? txt(d.createdBy, 120) : null,
+    updatedAt: date(d.updatedAt) || date(d.createdAt) || new Date(0).toISOString(),
+    history: (Array.isArray(d.history) ? d.history : []).filter(h => h && date(h.ts)).slice(0, 500).map(h => ({ ts:h.ts, text:txt(h.text, 1000) })),
+    photos: (Array.isArray(d.photos) ? d.photos : []).filter(p => p && typeof p.chemin === "string" && /^[0-9a-f-]{36}\/[a-z]+-[0-9]+\.jpg$/i.test(p.chemin) && date(p.ts))
+      .slice(0, 50).map(p => ({ phase: p.phase === "apres" ? "apres" : "avant", ts:p.ts, chemin:p.chemin })),
+    fieldTs: {},
+  };
+  if(out.lat === null || out.lng === null){ out.lat = null; out.lng = null; }
+  if(d.fieldTs && typeof d.fieldTs === "object") for(const [k, v] of Object.entries(d.fieldTs)) if(date(v)) out.fieldTs[k] = v;
+  if(typeof d.travauxId === "string" && /^[0-9a-f-]{36}$/i.test(d.travauxId)) out.travauxId = d.travauxId;
+  if(date(d.lastSharedAt)) out.lastSharedAt = d.lastSharedAt;
+  return out;
+}
+
 /* ---- Fusion de deux versions d'un même incident ---- */
 function mergeIncidents(a, b){
   if(!a) return b; if(!b) return a;
@@ -628,7 +659,7 @@ async function syncNow(manual){
       }
       const r = await sb.from("astreinte_incidents").select("donnees").eq("uuid", id).maybeSingle();
       if(r.error) throw r.error;
-      if(r.data) inc = mergeIncidents(r.data.donnees, inc);
+      if(r.data) inc = mergeIncidents(nettoyerDistant(r.data.donnees, id), inc);
       let w = await sb.from("astreinte_incidents").upsert(toRow(inc), { onConflict:"uuid" });
       if(w.error && w.error.code === "23503"){                // incident supprimé entre-temps du suivi des bâtiments
         inc.travauxId = null; w = await sb.from("astreinte_incidents").upsert(toRow(inc), { onConflict:"uuid" });
@@ -647,7 +678,7 @@ async function syncNow(manual){
       if(error) throw error;
       for(const row of data){
         const local = await incidentGet(row.uuid);
-        const fusion = mergeIncidents(local, row.donnees);
+        const fusion = mergeIncidents(local, nettoyerDistant(row.donnees, row.uuid));
         if(!local || JSON.stringify(fusion) !== JSON.stringify(local)) await incidentPutLocal(fusion);
         if(row.recu_le > plusRecent) plusRecent = row.recu_le;
       }
@@ -2463,9 +2494,22 @@ function renderPassationSummaryScreen(handover){
 
 /* ============================= ADMINISTRATION ============================= */
 
+async function codesParDefaut(){
+  const salt = await kvGet("pinSalt", "");
+  const admin = await kvGet("adminPinHash", null), def1234 = await sha256Hex(salt + "1234"), def9999 = await sha256Hex(salt + "9999");
+  return { admin: admin === def9999, users: (state.users || []).filter(u => u.pinHash === def1234).map(u => u.name) };
+}
+async function avertirCodesParDefaut(){
+  const z = document.getElementById("pinDefaut"); if(!z) return;
+  const c = await codesParDefaut();
+  const l = [c.admin ? "le code administrateur est encore 9999" : "", c.users.length ? `${c.users.length > 1 ? "les codes de" : "le code de"} ${c.users.join(", ")} ${c.users.length > 1 ? "sont" : "est"} encore 1234` : ""].filter(Boolean);
+  if(l.length) z.innerHTML = `<div class="card" style="border-color:var(--danger);"><p style="margin:0;color:var(--danger);font-weight:700;">⚠️ Sécurité : ${esc(l.join(" et "))}.</p><p style="margin:6px 0 0;color:var(--text-dim);">Changez-les dans Administration › Sécurité (codes PIN) : toute personne qui trouve le téléphone pourrait sinon ouvrir l'application.</p></div>`;
+}
 function renderAdminHome(){
+  setTimeout(avertirCodesParDefaut, 0);
   app.innerHTML = `
     ${topbar("Administration", "home")}
+    <div id="pinDefaut"></div>
     <button class="big-btn" data-nav="admin-commune"><span class="ic">🏛️</span><span class="lbl">Commune</span></button>
     <button class="big-btn" data-nav="admin-categories"><span class="ic">🗂️</span><span class="lbl">Catégories d'incident</span></button>
     <button class="big-btn" data-nav="admin-contacts"><span class="ic">☎️</span><span class="lbl">Contacts communaux</span></button>
