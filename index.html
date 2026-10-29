@@ -796,7 +796,8 @@ async function syncPlanning(sb, force){
   const agent = (a) => (a && typeof a === "object" && typeof a.nom === "string") ? { nom:String(a.nom).slice(0, 80), telephone:typeof a.telephone === "string" ? a.telephone.replace(/[^0-9+ ().-]/g, "").slice(0, 25) : null, remplace:typeof a.remplace === "string" ? String(a.remplace).slice(0, 80) : null } : null;
   const date = (x) => (typeof x === "string" && /^\d{4}-\d{2}-\d{2}$/.test(x)) ? x : null;
   const sem = (x) => (x && typeof x === "object") ? { debut:date(x.debut), fin:date(x.fin), titulaire:agent(x.titulaire) } : null;
-  const propre = { jour:date(d.jour), aujourdhui:agent(d.aujourdhui), semaine:sem(d.semaine), suivante:sem(d.suivante), demain:agent(d.demain_remplacement) };
+  const propre = { jour:date(d.jour), aujourdhui:agent(d.aujourdhui), semaine:sem(d.semaine), suivante:sem(d.suivante), demain:agent(d.demain_remplacement),
+    elus:(Array.isArray(d.elus) ? d.elus : []).slice(0, 100).map(agent).filter(Boolean) };
   await kvSetBrut("planningAstreinte", propre); await kvSetBrut("planningRecuLe", Date.now());
   state.planning = propre;
   if(parseHash().route === "home" && state.unlocked) renderHome();
@@ -1163,7 +1164,7 @@ async function ensureUsers(){
   raw = raw.map(u => (typeof u === "string") ? {id: uuid(), name: u} : {...u});
   for(const u of raw){
     if(!u.id){ u.id = uuid(); changed = true; }
-    if(!u.pinHash){
+    if(!u.pinHash && !u.pinAChoisir){
       // Ancien code astreinte commun s'il existe, sinon code par défaut 1234.
       const legacy = await kvGet("userPinHash", null);
       u.pinHash = legacy || await sha256Hex(salt + "1234");
@@ -1276,8 +1277,16 @@ function renderLoginChooseUser(){
     </div>
   </div>`;
   app.querySelectorAll("[data-loginuser]").forEach(b=>{
-    b.addEventListener("click", ()=>{
-      loginSelectedUser = state.users.find(u=>u.id===b.dataset.loginuser) || null;
+    b.addEventListener("click", async ()=>{
+      const u = state.users.find(x=>x.id===b.dataset.loginuser) || null;
+      if(u && u.pinAChoisir){                     // première connexion : la personne choisit son code
+        if(!(await choisirCodeOverlay(u))) return;
+        state.unlocked = true; state.pinFailCount = 0; await kvSet("pinFailCount", 0);
+        state.currentUser = u.name; await kvSet("currentUser", u.name);
+        loginSelectedUser = null; loginPinBuffer = "";
+        return render();
+      }
+      loginSelectedUser = u;
       loginPinBuffer = "";
       render();
     });
@@ -1466,6 +1475,45 @@ async function renderHome(){
 // commandes" (prise d'astreinte initiale, prise de passation) : on ne
 // permet plus de sélectionner un nom sans code personnel. Réutilise le
 // même hachage salé que l'écran de verrouillage principal.
+/* Première connexion d'un utilisateur importé : il choisit son code personnel (saisi deux fois) */
+function choisirCodeOverlay(user){
+  return new Promise(resolve => {
+    const overlay = document.createElement("div");
+    overlay.className = "sms-overlay";
+    document.body.appendChild(overlay);
+    let premier = null, buf = "";
+    const fin = (ok) => { overlay.remove(); resolve(ok); };
+    function draw(){
+      overlay.innerHTML = `<div class="sms-modal" style="text-align:center;">
+        <h3 style="margin-bottom:2px;">${esc(user.name)}</h3>
+        <p style="color:var(--text-dim);font-size:.82rem;margin-bottom:6px;">${premier ? "Saisissez-le une seconde fois" : "Première connexion : choisissez votre code personnel (4 chiffres)"}</p>
+        <div class="pindots" style="justify-content:center;">${[0,1,2,3].map(i=>`<div class="pindot ${i<buf.length?'filled':''}"></div>`).join("")}</div>
+        <div class="keypad" id="choixKeypad" style="margin-top:14px;">
+          ${[1,2,3,4,5,6,7,8,9].map(n=>`<button data-k="${n}">${n}</button>`).join("")}
+          <button data-k="clear" class="del">C</button><button data-k="0">0</button><button data-k="back" class="del">⌫</button>
+        </div>
+        <button class="ghost-full" id="choixAnnuler" style="margin-top:14px;">ANNULER</button></div>`;
+      overlay.querySelector("#choixAnnuler").addEventListener("click", () => fin(false));
+      overlay.querySelector("#choixKeypad").addEventListener("click", async (e) => {
+        const b = e.target.closest("button"); if(!b) return;
+        const k = b.dataset.k;
+        if(k === "clear") buf = ""; else if(k === "back") buf = buf.slice(0, -1); else if(buf.length < 4) buf += k;
+        if(buf.length < 4) return draw();
+        if(!premier){
+          if(["0000","1111","1234","2222","9999","4321","1212"].includes(buf)){ buf = ""; draw(); return showToast("Code trop simple : choisissez-en un autre", true); }
+          premier = buf; buf = ""; return draw();
+        }
+        if(buf !== premier){ premier = null; buf = ""; draw(); return showToast("Les deux codes ne correspondent pas, recommencez", true); }
+        const salt = await kvGet("pinSalt", "");
+        const u = state.users.find(x => x.id === user.id); if(!u) return fin(false);
+        u.pinHash = await sha256Hex(salt + buf); delete u.pinAChoisir;
+        try{ await kvSet("users", state.users); showToast("✅ Code personnel enregistré"); fin(true); }catch(err){ fin(false); }
+      });
+    }
+    draw();
+  });
+}
+
 function openUserAuthOverlay({title, hint, excludeUserId, onAuthenticated}){
   const overlay = document.createElement("div");
   overlay.className = "sms-overlay";
@@ -1495,6 +1543,11 @@ function openUserAuthOverlay({title, hint, excludeUserId, onAuthenticated}){
         el.addEventListener("click", ()=>{
           selected = state.users.find(u=>u.id===el.dataset.authuser) || null;
           pinBuf = "";
+          if(selected && selected.pinAChoisir){
+            const user = selected; overlay.remove();
+            choisirCodeOverlay(user).then(ok => { if(ok) onAuthenticated(user); });
+            return;
+          }
           draw();
         });
       });
@@ -2632,6 +2685,41 @@ function renderPassationSummaryScreen(handover){
 
 /* ============================= ADMINISTRATION ============================= */
 
+/* Création des utilisateurs à partir des élus du planning des astreintes */
+async function importerElusOverlay(){
+  if(!navigator.onLine) return showToast("Pas de réseau : l'import demande Internet", true);
+  try{ await syncPlanning(await srv(), true); }catch(e){ return showToast("Planning indisponible : " + srvErr(e), true); }
+  const elus = (state.planning && state.planning.elus) || [];
+  if(!elus.length) return showToast("Aucun élu trouvé dans le planning", true);
+  const existe = (n) => state.users.some(u => memeNom(u.name, n));
+  const defaut = state.users.filter(u => /^Élu \/ agent \d+$/.test(u.name));
+  const overlay = document.createElement("div");
+  overlay.className = "sms-overlay";
+  overlay.innerHTML = `<div class="sms-modal">
+    <h3 style="margin-bottom:2px;">Élus du planning</h3>
+    <p style="color:var(--text-dim);font-size:.82rem;margin-bottom:10px;">Chaque élu choisira son code personnel à sa première connexion sur ce téléphone. Les réglages des alertes SMS restent à faire dans sa fiche.</p>
+    <div class="sms-userlist">${elus.map((e, i) => `<label class="sms-user-row"><input type="checkbox" data-elu="${i}" ${existe(e.nom) ? "disabled" : "checked"}>
+      <span>${esc(e.nom)}${existe(e.nom) ? ` <small style="color:var(--text-dim);font-weight:400;">(déjà présent)</small>` : ""}</span></label>`).join("")}</div>
+    ${defaut.length ? `<label class="sms-user-row" style="margin-top:8px;"><input type="checkbox" id="retirerDefaut" checked><span>Retirer les utilisateurs par défaut (${defaut.map(u => esc(u.name)).join(", ")})</span></label>` : ""}
+    <button class="big-btn primary" id="impOk" style="margin-top:12px;"><span class="ic">➕</span><span class="lbl">Créer les utilisateurs cochés</span></button>
+    <button class="ghost-full" id="impAnnuler">Annuler</button></div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector("#impAnnuler").addEventListener("click", () => overlay.remove());
+  overlay.querySelector("#impOk").addEventListener("click", async () => {
+    const choix = [...overlay.querySelectorAll("[data-elu]:checked:not(:disabled)")].map(x => elus[Number(x.dataset.elu)]);
+    const retirer = overlay.querySelector("#retirerDefaut")?.checked;
+    let users = state.users.slice();
+    if(retirer) users = users.filter(u => !defaut.includes(u) || u.name === state.currentUser);
+    for(const e of choix) users.push({ id:uuid(), name:e.nom, phone:e.telephone || "", smsAlerts:false,
+      smsUrgencies:{ IMMEDIATE:true, URGENT:true, A_TRAITER:true, INFO:true }, pinAChoisir:true });
+    state.users = users;
+    try{ await kvSet("users", state.users); }catch(e){ return; }
+    overlay.remove();
+    showToast(`✅ ${choix.length} utilisateur${choix.length > 1 ? "s" : ""} créé${choix.length > 1 ? "s" : ""}`);
+    renderAdminUsers({});
+  });
+}
+
 async function codesParDefaut(){
   const salt = await kvGet("pinSalt", "");
   const admin = await kvGet("adminPinHash", null), def1234 = await sha256Hex(salt + "1234"), def9999 = await sha256Hex(salt + "9999");
@@ -2825,12 +2913,15 @@ function renderAdminUsers(params){
     <p style="color:var(--text-dim);font-size:.85rem;">Chaque élu ou agent se connecte avec son nom et son code personnel à 4 chiffres. Le numéro de téléphone sert uniquement à préremplir les alertes SMS.</p>
     <div id="userList"></div>
     <button class="primary-full" id="addUser">➕ Ajouter un utilisateur</button>
+    ${state.sync && state.sync.connected ? `<button class="ghost-full" id="importElus" style="margin-top:8px;">📅 Importer les élus du planning</button>` : ""}
   `;
+  const imp = document.getElementById("importElus");
+  if(imp) imp.addEventListener("click", importerElusOverlay);
   document.getElementById("userList").innerHTML = state.users.map(u=>`
     <div class="admin-item">
       <div class="lbl">
         ${esc(u.name)}
-        <div style="font-size:.78rem;color:var(--text-dim);">${u.phone ? esc(u.phone) : "Téléphone non renseigné"}${u.smsAlerts ? " · 📱 SMS" : ""}</div>
+        <div style="font-size:.78rem;color:var(--text-dim);">${u.phone ? esc(u.phone) : "Téléphone non renseigné"}${u.smsAlerts ? " · 📱 SMS" : ""}${u.pinAChoisir ? " · code choisi à la 1re connexion" : ""}</div>
       </div>
       <button class="iconbtn" data-edit="${esc(u.id)}" title="Modifier">✏️</button>
       <button class="iconbtn" data-reset="${esc(u.id)}" title="Réinitialiser le code">🔑</button>
