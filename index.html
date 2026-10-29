@@ -879,7 +879,12 @@ async function initSync(){
   state.sync.connected = await kvGet("srvConnected", false);
   state.sync.role = await kvGet("srvRole", null);
   state.mesSignalements = new Set(await kvGet("mesSignalements", []));
-  state.telAstreinte = await kvGet("telAstreinte", true);
+  // Nouvelle installation : téléphone personnel par défaut. Un téléphone déjà en service garde la passation.
+  state.telAstreinte = await kvGet("telAstreinte", null);
+  if(state.telAstreinte === null){
+    state.telAstreinte = (await kvGet("currentUser", null)) !== null || (await incidentAll()).length > 0;
+    await kvSetBrut("telAstreinte", state.telAstreinte);
+  }
   state.sync.lastOk = await kvGet("srvLastOk", null);
   state.sync.pending = (await pendingGet()).size;
   if(state.sync.connected){ scheduleSync(300); state.syncTimerOn = true; setInterval(() => scheduleSync(0), 120000); }
@@ -2858,7 +2863,7 @@ function renderAdminHome(){
     <div id="pinDefaut"></div>
     ${modeSignalement() ? "" : `<div class="card"><label style="display:flex;gap:12px;align-items:flex-start;cursor:pointer;">
       <input type="checkbox" id="telAstreinteChk" ${telAstreinte() ? "checked" : ""} style="width:22px;height:22px;flex:none;margin-top:2px;">
-      <span><b>Ce téléphone est le téléphone d'astreinte</b><br><span style="color:var(--text-dim);font-size:.88rem;">Décochez sur le téléphone personnel d'un élu : la passation et l'alerte « au nom de… » disparaissent, on voit seulement qui est d'astreinte.</span></span>
+      <span><b>Ce téléphone est le téléphone d'astreinte</b><br><span style="color:var(--text-dim);font-size:.88rem;">À cocher uniquement sur le téléphone dédié à l'astreinte : il affiche la passation et une alerte si le planning indique quelqu'un d'autre. Décochée (téléphone personnel), on voit seulement qui est d'astreinte.</span></span>
     </label></div>`}
     ${modeSignalement() ? `<div class="card"><p style="margin:0;color:var(--text-dim);">📝 Mode signalement : la commune, les catégories, les contacts et les consignes viennent du serveur de la mairie et se modifient depuis un téléphone de saisie.</p></div>` : `
     <button class="big-btn" data-nav="admin-commune"><span class="ic">🏛️</span><span class="lbl">Commune</span></button>
