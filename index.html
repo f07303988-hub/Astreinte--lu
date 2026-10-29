@@ -551,6 +551,8 @@ async function pendingAdd(uuid_){ const p = await pendingGet(); p.add(uuid_); aw
 /* Téléphone connecté avec un compte « lecteur » : mode signalement.
    L'agent crée des incidents et complète les siens (photos), sans changer de statut, ni passation, ni réglages. */
 const ROLES_SIGNALEMENT = ["lecteur", "agent"];
+/* Téléphone d'astreinte (dédié) ou téléphone personnel d'un élu : la passation n'a de sens que sur le premier */
+function telAstreinte(){ return !modeSignalement() && state.telAstreinte !== false; }
 function modeSignalement(){ return !!(state.sync && state.sync.connected && ROLES_SIGNALEMENT.includes(state.sync.role)); }
 function estMonSignalement(id){ return !!(state.mesSignalements && state.mesSignalements.has(id)); }
 const MSG_SIGNALEMENT = "Mode signalement : seul l'incident que vous avez signalé peut être complété";
@@ -838,7 +840,7 @@ function planningCardHtml(){
   const P = state.planning;
   if(!state.sync || !state.sync.connected || !P || !P.aujourdhui) return "";
   const a = P.aujourdhui, tel = a.telephone ? a.telephone.replace(/\s+/g, "") : "";
-  const decalage = !modeSignalement() && state.currentUser && !memeNom(state.currentUser, a.nom);
+  const decalage = telAstreinte() && state.currentUser && !memeNom(state.currentUser, a.nom);
   const auj = new Date().toLocaleDateString("sv-SE");
   const perime = P.jour && P.jour !== auj;
   let h = `<div class="card" style="margin-bottom:12px;">
@@ -877,6 +879,7 @@ async function initSync(){
   state.sync.connected = await kvGet("srvConnected", false);
   state.sync.role = await kvGet("srvRole", null);
   state.mesSignalements = new Set(await kvGet("mesSignalements", []));
+  state.telAstreinte = await kvGet("telAstreinte", true);
   state.sync.lastOk = await kvGet("srvLastOk", null);
   state.sync.pending = (await pendingGet()).size;
   if(state.sync.connected){ scheduleSync(300); state.syncTimerOn = true; setInterval(() => scheduleSync(0), 120000); }
@@ -1314,6 +1317,10 @@ async function render(){
     return renderAdminLock();
   }
 
+  if(route === "passation" && !modeSignalement() && !telAstreinte()){
+    showToast("Passation réservée au téléphone d'astreinte (Administration)", true);
+    return nav("home");
+  }
   if(modeSignalement() && ["passation","admin-commune","admin-categories","admin-contacts","admin-consignes"].includes(route)){
     showToast(MSG_SIGNALEMENT, true);
     return nav(route.startsWith("admin") ? "admin" : "home");
@@ -1531,7 +1538,7 @@ async function renderHome(){
       <h1>PASLY ASTREINTE</h1>
       <p class="subtitle">Gestion des incidents municipaux</p>
       ${syncBadgeHtml()}
-      ${modeSignalement() ? `<div class="duty-badge"><span class="db-label">👷 Agent</span><span class="db-name">${esc(state.currentUser || "")}</span></div>` : state.currentUser ? `<div class="duty-badge"><span class="db-label">👤 Astreinte actuelle</span><span class="db-name">${esc(state.currentUser)}</span></div>` : `<button class="link-btn" id="chooseInitialUser">Qui prend l'astreinte ?</button>`}
+      ${modeSignalement() ? `<div class="duty-badge"><span class="db-label">👷 Agent</span><span class="db-name">${esc(state.currentUser || "")}</span></div>` : !telAstreinte() ? (state.currentUser ? `<div class="duty-badge"><span class="db-label">👤 Connecté</span><span class="db-name">${esc(state.currentUser)}</span></div>` : "") : state.currentUser ? `<div class="duty-badge"><span class="db-label">👤 Astreinte actuelle</span><span class="db-name">${esc(state.currentUser)}</span></div>` : `<button class="link-btn" id="chooseInitialUser">Qui prend l'astreinte ?</button>`}
     </div>
 
     ${planningCardHtml()}
@@ -1552,7 +1559,7 @@ async function renderHome(){
     <button class="big-btn secondary" data-nav="carte"><span class="ic">📍</span><span class="lbl">Carte</span></button>
     <button class="big-btn secondary" data-nav="numeros"><span class="ic">☎️</span><span class="lbl">Numéros utiles</span></button>
     <button class="big-btn secondary" data-nav="consignes"><span class="ic">📖</span><span class="lbl">Consignes d'astreinte</span></button>
-    ${modeSignalement() ? "" : `<button class="big-btn secondary" data-nav="passation"><span class="ic">🔄</span><span class="lbl">Passation d'astreinte</span></button>`}
+    ${!telAstreinte() ? "" : `<button class="big-btn secondary" data-nav="passation"><span class="ic">🔄</span><span class="lbl">Passation d'astreinte</span></button>`}
     <button class="big-btn secondary" data-nav="admin-lock"><span class="ic">⚙️</span><span class="lbl">Administration</span></button>
     ${modeSignalement() ? `<button class="link-btn" id="agentLogout">⏏️ Se déconnecter de ce téléphone</button>` : ""}
   `;
@@ -2839,9 +2846,20 @@ async function avertirCodesParDefaut(){
 }
 function renderAdminHome(){
   setTimeout(avertirCodesParDefaut, 0);
+  setTimeout(() => {
+    const c = document.getElementById("telAstreinteChk");
+    if(c) c.addEventListener("change", async () => {
+      state.telAstreinte = c.checked; await kvSetBrut("telAstreinte", c.checked);
+      showToast(c.checked ? "Téléphone d'astreinte" : "Téléphone personnel : pas de passation");
+    });
+  }, 0);
   app.innerHTML = `
     ${topbar("Administration", "home")}
     <div id="pinDefaut"></div>
+    ${modeSignalement() ? "" : `<div class="card"><label style="display:flex;gap:12px;align-items:flex-start;cursor:pointer;">
+      <input type="checkbox" id="telAstreinteChk" ${telAstreinte() ? "checked" : ""} style="width:22px;height:22px;flex:none;margin-top:2px;">
+      <span><b>Ce téléphone est le téléphone d'astreinte</b><br><span style="color:var(--text-dim);font-size:.88rem;">Décochez sur le téléphone personnel d'un élu : la passation et l'alerte « au nom de… » disparaissent, on voit seulement qui est d'astreinte.</span></span>
+    </label></div>`}
     ${modeSignalement() ? `<div class="card"><p style="margin:0;color:var(--text-dim);">📝 Mode signalement : la commune, les catégories, les contacts et les consignes viennent du serveur de la mairie et se modifient depuis un téléphone de saisie.</p></div>` : `
     <button class="big-btn" data-nav="admin-commune"><span class="ic">🏛️</span><span class="lbl">Commune</span></button>
     <button class="big-btn" data-nav="admin-categories"><span class="ic">🗂️</span><span class="lbl">Catégories d'incident</span></button>
