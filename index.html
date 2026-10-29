@@ -451,7 +451,18 @@ function kvGet(key, fallback){
     r.onerror = () => reject(r.error);
   }));
 }
-function kvSet(key, value){
+// Réglages communs à tous les téléphones (partagés via le serveur de la mairie)
+const CONFIG_CLES = ["categories","municipalContacts","consignes","communeName","mairieEmail"];
+let configDepuisServeur = false;
+async function kvSet(key, value){
+  const ok = await kvSetBrut(key, value);
+  if(CONFIG_CLES.includes(key) && !configDepuisServeur){
+    try{ const ts = await kvGet("configTs", {}); ts[key] = new Date().toISOString(); await kvSetBrut("configTs", ts); }catch(e){}
+    if(typeof scheduleSync === "function") scheduleSync();
+  }
+  return ok;
+}
+function kvSetBrut(key, value){
   return txStore("kv","readwrite").then(store => new Promise((resolve,reject) => {
     const r = store.put({key, value});
     r.onsuccess = () => resolve(true);
@@ -672,6 +683,8 @@ async function syncNow(manual){
       await incidentPutLocal(inc);
       await pendingSave(pend);
     }
+    // 1 bis. Réglages communs (catégories, numéros utiles, consignes, commune)
+    await syncConfig(sb);
     // 2. Réception des incidents des autres téléphones
     let depuis = await kvGet("srvLastPull", "1970-01-01T00:00:00Z"), plusRecent = depuis;
     for(;;){
@@ -710,6 +723,61 @@ async function syncNow(manual){
     S.running = false;
     refreshSyncBadge();
     if(S.again){ S.again = false; scheduleSync(300); }
+  }
+}
+
+/* ---- Réglages communs ---- */
+function nettoyerConfigValeur(k, v){
+  const txt = (x, max) => String(x ?? "").slice(0, max);
+  const ident = (x) => /^[a-z0-9_-]{1,40}$/i.test(String(x || "")) ? String(x) : null;
+  const emoji = (x) => txt(x, 8).replace(/[<>"'&`]/g, "") || "•";
+  if(k === "categories"){
+    if(!Array.isArray(v)) return null;
+    const l = v.slice(0, 60).map(c => c && ident(c.id) ? { id:c.id, emoji:emoji(c.emoji), label:txt(c.label, 80) || c.id,
+      contactIds:(Array.isArray(c.contactIds) ? c.contactIds : []).map(ident).filter(Boolean).slice(0, 20) } : null).filter(Boolean);
+    return l.length ? l : null;
+  }
+  if(k === "municipalContacts"){
+    if(!Array.isArray(v)) return null;
+    return v.slice(0, 100).map(c => c && ident(c.id) ? { id:c.id, emoji:emoji(c.emoji), name:txt(c.name, 80) || c.id,
+      phone:txt(c.phone, 30).replace(/[^0-9+ ().-]/g, "") } : null).filter(Boolean);
+  }
+  if(k === "consignes") return typeof v === "string" ? txt(v, 20000) : null;
+  if(k === "communeName") return typeof v === "string" && v.trim() ? txt(v, 100) : null;
+  if(k === "mairieEmail") return typeof v === "string" ? (/^[^\s@<>"']+@[^\s@<>"']+\.[^\s@<>"']+$/.test(v.trim()) ? v.trim() : "") : null;
+  return null;
+}
+async function syncConfig(sb){
+  const r = await sb.from("parametres").select("valeur").eq("cle", "astreinte_config").maybeSingle();
+  if(r.error || !r.data) return;                         // réglages communs pas encore installés sur le serveur
+  const distant = (r.data.valeur && typeof r.data.valeur === "object") ? r.data.valeur : {};
+  const tsLocal = await kvGet("configTs", {});
+  // Réglages enregistrés avant le partage : date ancienne, le premier téléphone synchronisé sert de référence
+  for(const k of CONFIG_CLES) if(!tsLocal[k] && (await kvGet(k, null)) !== null) tsLocal[k] = "2000-01-01T00:00:00.000Z";
+  const fusion = { ...distant }; let aEnvoyer = false, applique = false;
+  for(const k of CONFIG_CLES){
+    const d = distant[k], dts = (d && typeof d.ts === "string") ? d.ts : "", lts = tsLocal[k] || "";
+    if(dts && dts >= lts && JSON.stringify(d.v) !== JSON.stringify(state[k])){
+      const v = nettoyerConfigValeur(k, d.v);
+      if(v === null) continue;
+      configDepuisServeur = true;
+      try{ state[k] = v; await kvSet(k, v); }finally{ configDepuisServeur = false; }
+      tsLocal[k] = dts; applique = true;
+    } else if(dts && dts >= lts){
+      tsLocal[k] = dts;
+    } else if(lts && lts > dts){
+      fusion[k] = { v:state[k], ts:lts, par:state.currentUser || "" }; aEnvoyer = true;
+    }
+  }
+  if(aEnvoyer){
+    const w = await sb.from("parametres").update({ valeur:fusion }).eq("cle", "astreinte_config").select("cle");
+    if(w.error) throw w.error;
+    if(!w.data || !w.data.length) throw new Error("Réglages communs non enregistrés : droits insuffisants");
+  }
+  await kvSetBrut("configTs", tsLocal);
+  if(applique){
+    const { route } = parseHash();
+    if(["home","numeros","consignes","admin-categories","admin-contacts","admin-consignes","admin-commune"].includes(route)) render();
   }
 }
 
@@ -890,7 +958,7 @@ async function ajouterContactSuez(){
   if(!state.municipalContacts.some(c => c.id === "suez_urgence")){
     const i = state.municipalContacts.findIndex(c => c.id === "eau");
     state.municipalContacts.splice(i >= 0 ? i + 1 : state.municipalContacts.length, 0, { ...suez });
-    await kvSet("municipalContacts", state.municipalContacts);
+    await kvSetBrut("municipalContacts", state.municipalContacts);
   }
   let modif = false;
   for(const c of state.categories){
@@ -898,7 +966,7 @@ async function ajouterContactSuez(){
       c.contactIds = c.id === "eau" ? ["suez_urgence", ...c.contactIds] : [...c.contactIds, "suez_urgence"]; modif = true;
     }
   }
-  if(modif) await kvSet("categories", state.categories);
+  if(modif) await kvSetBrut("categories", state.categories);
   await kvSet("migSuezUrgence", true);
 }
 
