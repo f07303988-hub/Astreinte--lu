@@ -357,15 +357,15 @@ const SMS_URGENCY_TEXT = {
 const DEFAULT_CATEGORIES = [
   {id:"voirie", emoji:"🚧", label:"Voirie", contactIds:["services_techniques","mairie"]},
   {id:"eclairage", emoji:"💡", label:"Éclairage", contactIds:["eclairage","mairie"]},
-  {id:"eau", emoji:"💧", label:"Eau / Assainissement", contactIds:["eau","assainissement","mairie"]},
+  {id:"eau", emoji:"💧", label:"Eau / Assainissement", contactIds:["suez_urgence","eau","assainissement","mairie"]},
   {id:"arbre", emoji:"🌳", label:"Arbre / Espaces verts", contactIds:["services_techniques","espaces_verts","pompiers"]},
   {id:"batiment", emoji:"🏠", label:"Bâtiment communal", contactIds:["services_techniques","mairie"]},
   {id:"stade", emoji:"⚽", label:"Stade / Équipement", contactIds:["services_techniques","mairie"]},
-  {id:"incendie", emoji:"🔥", label:"Incendie / Sinistre", contactIds:["pompiers","urgence112","mairie"]},
+  {id:"incendie", emoji:"🔥", label:"Incendie / Sinistre", contactIds:["pompiers","urgence112","mairie","suez_urgence"]},
   {id:"danger", emoji:"⚠️", label:"Danger", contactIds:["police","pompiers","services_techniques"]},
   {id:"proprete", emoji:"🗑️", label:"Propreté / Dépôt", contactIds:["services_techniques","mairie"]},
   {id:"stationnement", emoji:"🚗", label:"Stationnement", contactIds:["police","mairie"]},
-  {id:"inondation", emoji:"🌧️", label:"Inondation / Intempéries", contactIds:["services_techniques","pompiers","mairie"]},
+  {id:"inondation", emoji:"🌧️", label:"Inondation / Intempéries", contactIds:["services_techniques","pompiers","mairie","suez_urgence"]},
   {id:"autre", emoji:"❓", label:"Autre", contactIds:["mairie"]},
 ];
 
@@ -379,6 +379,7 @@ const DEFAULT_MUNICIPAL_CONTACTS = [
   {id:"mairie", emoji:"🏛️", name:"Mairie", phone:""},
   {id:"services_techniques", emoji:"🔧", name:"Services techniques", phone:""},
   {id:"eau", emoji:"💧", name:"Eau", phone:""},
+  {id:"suez_urgence", emoji:"🚰", name:"Suez Eau – urgence réseau (24 h/24)", phone:"0977 401 120"},
   {id:"assainissement", emoji:"🚽", name:"Assainissement", phone:""},
   {id:"eclairage", emoji:"💡", name:"Éclairage public", phone:""},
   {id:"electricite", emoji:"⚡", name:"Électricité", phone:""},
@@ -880,6 +881,25 @@ async function openTravauxOverlay(incident){
       renderFiche({ uuid:inc.uuid });
     }catch(e){ btn.disabled = false; showToast("Transmission impossible : " + srvErr(e), true); }
   });
+}
+
+/* Ajout du numéro d'urgence Suez sur les téléphones déjà installés (une seule fois) */
+async function ajouterContactSuez(){
+  if(await kvGet("migSuezUrgence", false)) return;
+  const suez = DEFAULT_MUNICIPAL_CONTACTS.find(c => c.id === "suez_urgence");
+  if(!state.municipalContacts.some(c => c.id === "suez_urgence")){
+    const i = state.municipalContacts.findIndex(c => c.id === "eau");
+    state.municipalContacts.splice(i >= 0 ? i + 1 : state.municipalContacts.length, 0, { ...suez });
+    await kvSet("municipalContacts", state.municipalContacts);
+  }
+  let modif = false;
+  for(const c of state.categories){
+    if((c.id === "eau" || c.id === "incendie" || c.id === "inondation") && Array.isArray(c.contactIds) && !c.contactIds.includes("suez_urgence")){
+      c.contactIds = c.id === "eau" ? ["suez_urgence", ...c.contactIds] : [...c.contactIds, "suez_urgence"]; modif = true;
+    }
+  }
+  if(modif) await kvSet("categories", state.categories);
+  await kvSet("migSuezUrgence", true);
 }
 
 /* ============================= UTILITAIRES ============================= */
@@ -2873,6 +2893,7 @@ async function init(){
     await ensurePins();
     await ensureUsers();
     await loadConfig();
+    await ajouterContactSuez();
     await initSync();
   }catch(e){
     document.getElementById("app").innerHTML = "<p style='padding:24px;'>Erreur d'initialisation de l'application. Rechargez la page.</p>";
