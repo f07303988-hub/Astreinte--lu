@@ -3240,7 +3240,16 @@ async function init(){
     return;
   }
   if("serviceWorker" in navigator){
-    navigator.serviceWorker.register("./sw.js").catch(()=>{});
+    // Mise à jour automatique : dès qu'une nouvelle version est installée, la page se recharge une fois
+    const avaitVersion = !!navigator.serviceWorker.controller;
+    let recharge = false;
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if(!avaitVersion || recharge) return;
+      recharge = true; location.reload();
+    });
+    navigator.serviceWorker.register("./sw.js").then(reg => {
+      document.addEventListener("visibilitychange", () => { if(!document.hidden) reg.update().catch(()=>{}); });
+    }).catch(()=>{});
   }
   render();
 }
