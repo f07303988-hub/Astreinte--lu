@@ -931,7 +931,10 @@ function alertesPossibles(){
 }
 async function appelAlertes(corps){
   const sb = await srv();
-  const { data, error } = await sb.functions.invoke("alerter-astreinte", { body:corps });
+  // La connexion du téléphone est transmise explicitement (sinon le serveur ne sait pas qui appelle)
+  const { data:{ session } } = await sb.auth.getSession();
+  if(!session) throw new Error("Téléphone non connecté au serveur de la mairie : reconnectez-le dans Administration › Serveur de la mairie");
+  const { data, error } = await sb.functions.invoke("alerter-astreinte", { body:corps, headers:{ Authorization:"Bearer " + session.access_token } });
   if(error){
     let m = error.message; try{ const j = await error.context.json(); if(j && j.erreur) m = j.erreur; }catch(e){}
     throw new Error(m);
