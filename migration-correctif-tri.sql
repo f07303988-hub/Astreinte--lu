@@ -6,6 +6,7 @@
 -- 2. Mode signalement (agent, lecteur) : au lieu de refuser une modification, la base ne garde que ce que
 --    l'agent a le droit d'ajouter (photos, lignes d'historique) ; statut, lien Travaux et tri restent intacts.
 -- 3. Un agent ou un lecteur voit ses propres signalements (et leurs photos), jamais ceux des autres.
+-- 4. « Écarter » et « Remettre à valider » apparaissent dans l'historique de l'incident sur les téléphones.
 -- À exécuter une fois dans Supabase > SQL Editor (projet mairie-pasly). Ne supprime aucune donnée.
 -- =====================================================================
 create or replace function public.astreinte_avant_ecriture() returns trigger
@@ -39,7 +40,18 @@ begin
             where not (coalesce(old.donnees->'history', '[]'::jsonb) @> jsonb_build_array(h))), '[]'::jsonb),
         'updatedAt', coalesce(new.donnees->'updatedAt', old.donnees->'updatedAt'));
     end if;
-    if new.tri is distinct from old.tri then new.tri_le := now(); new.tri_par := auth.uid(); end if;
+    if new.tri is distinct from old.tri then
+      new.tri_le := now(); new.tri_par := auth.uid();
+      -- La décision de la mairie apparaît dans l'historique de l'incident sur les téléphones
+      if new.tri = 'ecarte' or (new.tri = 'a_valider' and old.tri = 'ecarte') then
+        new.donnees := new.donnees || jsonb_build_object('history', coalesce(new.donnees->'history', '[]'::jsonb) || jsonb_build_array(jsonb_build_object(
+          'ts', to_char(clock_timestamp() at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+          'text', case when new.tri = 'ecarte'
+                    then '🗂️ Écarté par la mairie (pas de suivi bâtiments)' || coalesce(' : ' || nullif(trim(new.tri_motif), ''), '')
+                    else '↩️ Remis à valider par la mairie' end
+                  || coalesce(' · par ' || (select coalesce(nullif(trim(nom), ''), email) from public.profils where id = auth.uid()), ''))));
+      end if;
+    end if;
   end if;
   if new.incident_id is not null and new.tri <> 'transmis' then
     new.tri := 'transmis'; new.tri_le := coalesce(new.tri_le, now()); new.tri_par := coalesce(new.tri_par, auth.uid());
