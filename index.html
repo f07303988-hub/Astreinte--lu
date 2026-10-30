@@ -276,6 +276,14 @@ textarea{min-height:90px;resize:vertical;}
 .section-title:first-child{margin-top:0;}
 .lockscreen{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;padding:24px;}
 .lockscreen .siren{font-size:3rem;}
+/* Écrans d'ouverture : plein écran fixe, centré, sans défilement (défile seulement si l'écran est trop petit) */
+body.verrou{overflow:hidden;position:fixed;inset:0;}
+.lockscreen.plein{position:fixed;inset:0;z-index:5;min-height:0;justify-content:flex-start;overflow-y:auto;overscroll-behavior:none;background:var(--bg);
+  padding:calc(20px + env(safe-area-inset-top)) 24px calc(16px + env(safe-area-inset-bottom));}
+.lockscreen.plein > :first-child{margin-top:auto;}
+.lockscreen.plein > .credit{margin-top:auto;}
+@media (max-height:740px){ .lockscreen.plein{gap:10px;} .lockscreen.plein .siren{font-size:2.2rem;} .lockscreen.plein h1{margin:0;} .lockscreen.plein .keypad button{min-height:0;height:54px;} }
+.credit{color:var(--text-dim);font-size:.75rem;opacity:.75;text-align:center;margin:0;padding-top:8px;}
 .pindots{display:flex;gap:14px;margin:6px 0;}
 .pindot{width:16px;height:16px;border-radius:50%;background:var(--card);border:1px solid var(--border);}
 .pindot.filled{background:var(--accent);border-color:var(--accent);}
@@ -1063,7 +1071,7 @@ async function deconnecterAgent(){
 }
 function renderConnexionAgent(){
   app.innerHTML = `
-  <div class="lockscreen">
+  <div class="lockscreen plein">
     <div class="siren">👷</div>
     <h1 style="font-size:1.3rem;text-align:center;margin-bottom:0;">Connexion agent</h1>
     <p style="color:var(--text-dim);text-align:center;margin-top:0;">Avec l'identifiant et le mot de passe fournis par la mairie. À faire une seule fois sur ce téléphone.</p>
@@ -1073,6 +1081,7 @@ function renderConnexionAgent(){
       <button class="big-btn primary" id="agGo" style="margin:4px 0 0;"><span class="ic">🔗</span><span class="lbl">Se connecter</span></button>
       <button class="link-btn" id="agBack">← Retour</button>
     </div>
+    <p class="credit">Développé par François Liéveaux</p>
   </div>`;
   const by = (id) => document.getElementById(id);
   by("agBack").addEventListener("click", () => { connexionAgentOuverte = false; render(); });
@@ -1449,6 +1458,7 @@ async function render(){
     document.getElementById("offlineBanner").classList.remove("show");
   }
 
+  document.body.classList.toggle("verrou", !state.unlocked && !modeSignalement());
   if(!state.unlocked && modeSignalement()){
     state.unlocked = true;
     state.currentUser = await kvGet("srvNom", null) || state.currentUser;
@@ -1524,7 +1534,7 @@ function renderLoginChooseUser(){
   // Le dernier utilisateur de ce téléphone est proposé en premier
   const dernier = state.users.find(u => u.name === state.currentUser);
   app.innerHTML = `
-  <div class="lockscreen">
+  <div class="lockscreen plein">
     <div class="siren">🚨</div>
     <h1 style="font-size:1.4rem;text-align:center;margin-bottom:0;">PASLY ASTREINTE</h1>
     <p class="secure-tag">🔒 Accès sécurisé</p>
@@ -1539,6 +1549,7 @@ function renderLoginChooseUser(){
       : `<p style="color:var(--text-dim);">Aucun utilisateur configuré. Contactez l'administrateur.</p>`}
     </div>
     <button class="link-btn" id="agentLogin">👷 Agent : se connecter pour faire des signalements</button>
+    <p class="credit">Développé par François Liéveaux</p>
   </div>`;
   document.getElementById("agentLogin").addEventListener("click", () => { connexionAgentOuverte = true; render(); });
   const sel = document.getElementById("loginUserSel"), go = document.getElementById("loginUserGo");
@@ -1564,7 +1575,7 @@ function renderLoginEnterCode(){
   const now = Date.now();
   const locked = now < state.pinLockUntil;
   app.innerHTML = `
-  <div class="lockscreen">
+  <div class="lockscreen plein">
     <div class="siren">🚨</div>
     <h1 style="font-size:1.3rem;text-align:center;">${esc(loginSelectedUser.name)}</h1>
     <p style="color:var(--text-dim);text-align:center;margin-top:-8px;">${locked ? "Trop de tentatives — patientez" : "Entrez votre code personnel"}</p>
@@ -1576,6 +1587,7 @@ function renderLoginEnterCode(){
       <button data-k="back" class="del">⌫</button>
     </div>
     <button class="link-btn" id="loginChangeUser">Ce n'est pas moi</button>
+    <p class="credit">Développé par François Liéveaux</p>
   </div>`;
   document.getElementById("loginChangeUser").addEventListener("click", ()=>{
     loginSelectedUser = null; loginPinBuffer = ""; render();
