@@ -1402,33 +1402,43 @@ function renderLock(){
 }
 
 function renderLoginChooseUser(){
+  // Le dernier utilisateur de ce téléphone est proposé en premier
+  const dernier = state.users.find(u => u.name === state.currentUser);
   app.innerHTML = `
   <div class="lockscreen">
     <div class="siren">🚨</div>
     <h1 style="font-size:1.4rem;text-align:center;margin-bottom:0;">PASLY ASTREINTE</h1>
     <p class="secure-tag">🔒 Accès sécurisé</p>
-    <p style="color:var(--text-dim);text-align:center;margin-top:0;">Qui êtes-vous ?</p>
     <div class="card" style="width:100%;max-width:340px;margin-top:8px;">
-      ${state.users.length ? state.users.map(u=>`<button class="ghost-full" data-loginuser="${esc(u.id)}" style="text-align:left;">${esc(u.name)}</button>`).join("") : `<p style="color:var(--text-dim);">Aucun utilisateur configuré. Contactez l'administrateur.</p>`}
+      ${state.users.length ? `
+        <label for="loginUserSel" style="display:block;font-weight:700;margin-bottom:8px;">Qui êtes-vous ?</label>
+        <select id="loginUserSel" style="width:100%;font-size:1.05rem;padding:12px;">
+          <option value="">Choisir votre nom…</option>
+          ${state.users.map(u=>`<option value="${esc(u.id)}" ${dernier && dernier.id === u.id ? "selected" : ""}>${esc(u.name)}</option>`).join("")}
+        </select>
+        <button class="big-btn primary" id="loginUserGo" style="margin:12px 0 0;"><span class="ic">🔓</span><span class="lbl">Continuer</span></button>`
+      : `<p style="color:var(--text-dim);">Aucun utilisateur configuré. Contactez l'administrateur.</p>`}
     </div>
     <button class="link-btn" id="agentLogin">👷 Agent : se connecter pour faire des signalements</button>
   </div>`;
   document.getElementById("agentLogin").addEventListener("click", () => { connexionAgentOuverte = true; render(); });
-  app.querySelectorAll("[data-loginuser]").forEach(b=>{
-    b.addEventListener("click", async ()=>{
-      const u = state.users.find(x=>x.id===b.dataset.loginuser) || null;
-      if(u && u.pinAChoisir){                     // première connexion : la personne choisit son code
-        if(!(await choisirCodeOverlay(u))) return;
-        state.unlocked = true; state.pinFailCount = 0; await kvSet("pinFailCount", 0);
-        state.currentUser = u.name; await kvSet("currentUser", u.name);
-        loginSelectedUser = null; loginPinBuffer = "";
-        return render();
-      }
-      loginSelectedUser = u;
-      loginPinBuffer = "";
-      render();
-    });
-  });
+  const sel = document.getElementById("loginUserSel"), go = document.getElementById("loginUserGo");
+  if(!sel) return;
+  const continuer = async ()=>{
+    const u = state.users.find(x=>x.id===sel.value) || null;
+    if(!u) return showToast("Choisissez votre nom dans la liste", true);
+    if(u.pinAChoisir){                     // première connexion : la personne choisit son code
+      if(!(await choisirCodeOverlay(u))) return;
+      state.unlocked = true; state.pinFailCount = 0; await kvSet("pinFailCount", 0);
+      state.currentUser = u.name; await kvSet("currentUser", u.name);
+      loginSelectedUser = null; loginPinBuffer = "";
+      return render();
+    }
+    loginSelectedUser = u;
+    loginPinBuffer = "";
+    render();
+  };
+  go.addEventListener("click", continuer);
 }
 
 function renderLoginEnterCode(){
