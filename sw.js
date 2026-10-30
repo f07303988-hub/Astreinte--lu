@@ -3,7 +3,7 @@
 // bibliothèque cartographique (Leaflet) et des tuiles OpenStreetMap déjà
 // consultées, pour que la carte reste utilisable hors connexion sur les
 // zones déjà visitées.
-const CACHE_NAME = "pasly-astreinte-v19";
+const CACHE_NAME = "pasly-astreinte-v20";
 const SHELL_FILES = [
   "./index.html",
   "./manifest.json",

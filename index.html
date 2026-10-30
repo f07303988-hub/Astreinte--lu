@@ -994,7 +994,10 @@ async function prevenirNouveaux(){
   await kvSetBrut("alertesAEnvoyer", reste);
 }
 function alertesCardHtml(){
-  if(modeSignalement() || !state.sync.connected) return "";
+  if(modeSignalement()) return "";
+  if(!state.sync.connected) return `<div class="card"><p style="margin:0;"><b>🔔 Alertes de nouveaux incidents</b></p>
+    <p style="color:var(--text-dim);margin:6px 0 10px;font-size:.88rem;">Ce téléphone n'est pas connecté au serveur de la mairie : connectez-le d'abord, puis revenez ici pour activer les alertes.</p>
+    <button class="ghost-full" data-nav="admin-serveur" style="margin:0;">🔗 Serveur de la mairie</button></div>`;
   return `<div class="card" id="alertesCard"><p style="margin:0;"><b>🔔 Alertes de nouveaux incidents</b></p><p style="color:var(--text-dim);margin:6px 0 0;font-size:.88rem;">Chargement…</p></div>`;
 }
 async function remplirAlertesCard(){
