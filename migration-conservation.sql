@@ -57,7 +57,7 @@ begin
                   || coalesce(' · par ' || (select coalesce(nullif(trim(nom), ''), email) from public.profils where id = auth.uid()), ''))));
       end if;
     end if;
-    -- Une anonymisation est définitive : un téléphone ne peut pas renvoyer les coordonnées effacées
+    -- Photos supprimées par la mairie : un téléphone ne peut pas les renvoyer
     if jsonb_typeof(old.donnees->'photosSupprimees') = 'array' then
       new.donnees := new.donnees || jsonb_build_object(
         'photosSupprimees', (select coalesce(jsonb_agg(distinct c), '[]'::jsonb) from jsonb_array_elements(
@@ -65,6 +65,7 @@ begin
         'photos', (select coalesce(jsonb_agg(p), '[]'::jsonb) from jsonb_array_elements(coalesce(new.donnees->'photos', '[]'::jsonb)) p
             where not (old.donnees->'photosSupprimees' @> jsonb_build_array(p->'chemin'))));
     end if;
+    -- Une anonymisation est définitive : un téléphone ne peut pas renvoyer les coordonnées effacées
     if (old.donnees->>'anonymise') = 'true' then
       new.donnees := new.donnees || jsonb_build_object('anonymise', true,
         'reporterName', case when coalesce(new.donnees->>'reporterName', '') = '' then '' else 'Habitant (anonymisé)' end,
