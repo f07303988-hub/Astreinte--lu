@@ -708,11 +708,16 @@ async function syncNow(manual){
       const r = await sb.from("astreinte_incidents").select("donnees").eq("uuid", id).maybeSingle();
       if(r.error) throw r.error;
       if(r.data) inc = mergeIncidents(nettoyerDistant(r.data.donnees, id), inc);
+      const nouveauSurServeur = !r.data && !(await kvGet("alertesConnues", [])).includes(id);
       let w = await sb.from("astreinte_incidents").upsert(toRow(inc), { onConflict:"uuid" });
       if(w.error && w.error.code === "23503"){                // incident supprimé entre-temps du suivi des bâtiments
         inc.travauxId = null; w = await sb.from("astreinte_incidents").upsert(toRow(inc), { onConflict:"uuid" });
       }
       if(w.error) throw w.error;
+      if(nouveauSurServeur){
+        const f = await kvGet("alertesAEnvoyer", []); if(!f.includes(id)) await kvSetBrut("alertesAEnvoyer", [...f, id]);
+        const c = await kvGet("alertesConnues", []); await kvSetBrut("alertesConnues", [...c, id].slice(-300));
+      }
       const now = await incidentGet(id);
       if(now && now.updatedAt !== version){ inc = mergeIncidents(inc, now); }   // modifié pendant l'envoi : on garde tout
       else pend.delete(id);
@@ -728,6 +733,8 @@ async function syncNow(manual){
      }
     }
     if(refusees) showToast(`${refusees} modification${refusees > 1 ? "s refusées" : " refusée"} par la mairie (droits insuffisants)`, true);
+    // 1 a. Notification des autres téléphones pour les nouveaux incidents
+    try{ await prevenirNouveaux(); }catch(e){}
     // 1 bis. Réglages communs (catégories, numéros utiles, consignes, commune)
     await syncConfig(sb);
     // 1 ter. Qui est d'astreinte d'après le planning (au plus toutes les 15 minutes)
@@ -909,7 +916,110 @@ async function initSync(){
   state.sync.pending = (await pendingGet()).size;
   if(state.sync.connected){ scheduleSync(300); state.syncTimerOn = true; setInterval(() => scheduleSync(0), 120000); }
   window.addEventListener("online", () => scheduleSync(500));
+  if("serviceWorker" in navigator) navigator.serviceWorker.addEventListener("message", (e) => { if(e.data && e.data.type === "nouvel-incident") scheduleSync(0); });
+  if(state.sync.connected) setTimeout(rafraichirAlertes, 4000);
   document.addEventListener("visibilitychange", () => { if(!document.hidden) scheduleSync(500); });
+}
+
+/* ---- Notifications de nouveaux incidents ---- */
+const estIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const estInstallee = () => window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+function alertesPossibles(){
+  if(estIOS && !estInstallee()) return "Sur iPhone, installez d'abord l'appli sur l'écran d'accueil (bouton Partager › « Sur l'écran d'accueil »), puis ouvrez-la depuis son icône.";
+  if(!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) return "Ce téléphone ou ce navigateur ne permet pas les notifications.";
+  return null;
+}
+async function appelAlertes(corps){
+  const sb = await srv();
+  const { data, error } = await sb.functions.invoke("alerter-astreinte", { body:corps });
+  if(error){
+    let m = error.message; try{ const j = await error.context.json(); if(j && j.erreur) m = j.erreur; }catch(e){}
+    throw new Error(m);
+  }
+  if(data && data.erreur) throw new Error(data.erreur);
+  return data || {};
+}
+async function monAbonnement(){
+  try{ const reg = await navigator.serviceWorker.ready; return await reg.pushManager.getSubscription(); }catch(e){ return null; }
+}
+function cleEnOctets(b64){
+  const t = b64.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((b64.length + 3) % 4);
+  return Uint8Array.from(atob(t), c => c.charCodeAt(0));
+}
+const nomAppareil = () => (estIOS ? "iPhone" : /Android/.test(navigator.userAgent) ? "Android" : "Ordinateur") + (state.currentUser ? " · " + state.currentUser : "") + (telAstreinte() ? " (astreinte)" : "");
+async function activerAlertes(){
+  const obstacle = alertesPossibles(); if(obstacle) throw new Error(obstacle);
+  if(!navigator.onLine) throw new Error("Pas de réseau : l'activation demande Internet");
+  const perm = await Notification.requestPermission();
+  if(perm !== "granted") throw new Error("Notifications refusées. Autorisez-les dans les réglages du téléphone (Notifications › Pasly Astreinte), puis réessayez.");
+  const { cle } = await appelAlertes({ action:"cle" });
+  const reg = await navigator.serviceWorker.ready;
+  let ab = await reg.pushManager.getSubscription();
+  if(ab){
+    const actuelle = ab.options && ab.options.applicationServerKey ? new Uint8Array(ab.options.applicationServerKey) : null;
+    const voulue = cleEnOctets(cle);
+    if(actuelle && (actuelle.length !== voulue.length || actuelle.some((x, i) => x !== voulue[i]))){ await ab.unsubscribe(); ab = null; }
+  }
+  if(!ab) ab = await reg.pushManager.subscribe({ userVisibleOnly:true, applicationServerKey:cleEnOctets(cle) });
+  await appelAlertes({ action:"abonner", abonnement:ab.toJSON(), appareil:nomAppareil() });
+  await kvSetBrut("alertesActives", true);
+  await appelAlertes({ action:"tester", endpoint:ab.endpoint }).catch(()=>{});
+}
+async function desactiverAlertes(){
+  const ab = await monAbonnement();
+  if(ab){ try{ await appelAlertes({ action:"desabonner", endpoint:ab.endpoint }); }catch(e){} try{ await ab.unsubscribe(); }catch(e){} }
+  await kvSetBrut("alertesActives", false);
+}
+// À l'ouverture : abonnement confirmé auprès du serveur (il peut changer avec le temps)
+async function rafraichirAlertes(){
+  try{
+    if(!(await kvGet("alertesActives", false)) || alertesPossibles() || Notification.permission !== "granted" || !navigator.onLine || modeSignalement()) return;
+    const ab = await monAbonnement();
+    if(ab) await appelAlertes({ action:"abonner", abonnement:ab.toJSON(), appareil:nomAppareil() });
+    else await activerAlertes();
+  }catch(e){}
+}
+// Après l'envoi d'un nouvel incident : les autres téléphones sont prévenus (une seule fois par incident)
+async function prevenirNouveaux(){
+  let file = await kvGet("alertesAEnvoyer", []);
+  if(!file.length || !navigator.onLine) return;
+  const ab = await monAbonnement(), reste = [];
+  for(const uuid of file){
+    try{ await appelAlertes({ action:"alerter", uuid, endpoint:ab ? ab.endpoint : null }); }
+    catch(e){ if(/Pas de réseau|Failed to fetch|NetworkError|Load failed|indisponible|réessayez|Base pas prête/i.test(e.message || "")) reste.push(uuid); }
+  }
+  await kvSetBrut("alertesAEnvoyer", reste);
+}
+function alertesCardHtml(){
+  if(modeSignalement() || !state.sync.connected) return "";
+  return `<div class="card" id="alertesCard"><p style="margin:0;"><b>🔔 Alertes de nouveaux incidents</b></p><p style="color:var(--text-dim);margin:6px 0 0;font-size:.88rem;">Chargement…</p></div>`;
+}
+async function remplirAlertesCard(){
+  const c = document.getElementById("alertesCard"); if(!c) return;
+  const obstacle = alertesPossibles();
+  const actif = !obstacle && Notification.permission === "granted" && !!(await monAbonnement()) && await kvGet("alertesActives", false);
+  c.innerHTML = `<p style="margin:0;"><b>🔔 Alertes de nouveaux incidents</b> ${actif ? "· <span style='color:var(--ok, #3fb950)'>activées</span>" : ""}</p>
+    <p style="color:var(--text-dim);margin:6px 0 10px;font-size:.88rem;">${obstacle ? esc(obstacle) : actif
+      ? "Ce téléphone reçoit une notification à chaque nouvel incident saisi sur un autre téléphone (agents compris), même appli fermée."
+      : "À activer sur le téléphone d'astreinte (et, si vous le souhaitez, sur ceux des élus) : une notification arrive à chaque nouvel incident, même appli fermée."}</p>
+    ${obstacle ? "" : actif
+      ? `<div style="display:flex;gap:8px;"><button class="ghost-full" id="alertesTest" style="margin:0;">Tester</button><button class="ghost-full" id="alertesOff" style="margin:0;">Désactiver</button></div>`
+      : `<button class="big-btn primary" id="alertesOn" style="margin:0;"><span class="ic">🔔</span><span class="lbl">Activer sur ce téléphone</span></button>`}`;
+  const by = (id) => document.getElementById(id);
+  if(by("alertesOn")) by("alertesOn").addEventListener("click", async () => {
+    by("alertesOn").disabled = true;
+    try{ await activerAlertes(); showToast("✅ Alertes activées : une notification de test arrive"); }
+    catch(e){ showToast(e.message || String(e), true); }
+    remplirAlertesCard();
+  });
+  if(by("alertesOff")) by("alertesOff").addEventListener("click", async () => {
+    if(!confirm("Ne plus recevoir les alertes de nouveaux incidents sur ce téléphone ?")) return;
+    await desactiverAlertes(); showToast("Alertes désactivées"); remplirAlertesCard();
+  });
+  if(by("alertesTest")) by("alertesTest").addEventListener("click", async () => {
+    try{ const ab = await monAbonnement(); const r = await appelAlertes({ action:"tester", endpoint:ab.endpoint }); showToast(r.ok ? "Notification de test envoyée" : "Le service de notification a refusé (" + r.code + ")", !r.ok); }
+    catch(e){ showToast(e.message || String(e), true); }
+  });
 }
 
 /* ---- Connexion d'un agent depuis l'écran d'accueil (mode signalement, sans liste de noms ni code) ---- */
@@ -1003,6 +1113,7 @@ async function renderAdminServeur(){
   if(by("srvLogout")) by("srvLogout").addEventListener("click", async () => {
     const n = (await pendingGet()).size;
     if(!confirm(n ? `${n} incident(s) n'ont pas encore été envoyés. Ils restent sur ce téléphone et partiront si vous le reconnectez. Déconnecter ?` : "Déconnecter ce téléphone du serveur de la mairie ? Les incidents restent sur le téléphone.")) return;
+    try{ await desactiverAlertes(); }catch(e){}
     try{ const sb = await srv(); await sb.auth.signOut(); }catch(e){}
     await kvSet("srvConnected", false); await kvSet("srvRole", null); await kvSet("srvNom", null); state.sync.connected = false; state.sync.role = null; state.sync.error = null;
     showToast("Téléphone déconnecté du serveur"); renderAdminServeur();
@@ -1030,6 +1141,8 @@ async function renderAdminServeur(){
       // Premier envoi : tous les incidents déjà présents sur ce téléphone (sauf en consultation seule)
       if(!ROLES_SIGNALEMENT.includes(role)){
         const tous = await incidentAll(), pend = await pendingGet();
+        // Les incidents déjà présents sur ce téléphone ne déclenchent pas de notification
+        await kvSetBrut("alertesConnues", [...new Set([...(await kvGet("alertesConnues", [])), ...tous.map(i => i.uuid)])].slice(-300));
         tous.forEach(i => pend.add(i.uuid)); await pendingSave(pend);
       }
       showToast(ROLES_SIGNALEMENT.includes(role) ? "✅ Téléphone connecté en mode signalement" : "✅ Téléphone connecté au serveur de la mairie");
@@ -2890,6 +3003,7 @@ async function avertirCodesParDefaut(){
 }
 function renderAdminHome(){
   setTimeout(avertirCodesParDefaut, 0);
+  setTimeout(remplirAlertesCard, 0);
   setTimeout(() => {
     const c = document.getElementById("telAstreinteChk");
     if(c) c.addEventListener("change", async () => {
@@ -2900,6 +3014,7 @@ function renderAdminHome(){
   app.innerHTML = `
     ${topbar("Administration", "home")}
     <div id="pinDefaut"></div>
+    ${alertesCardHtml()}
     ${modeSignalement() ? "" : `<div class="card"><label style="display:flex;gap:12px;align-items:flex-start;cursor:pointer;">
       <input type="checkbox" id="telAstreinteChk" ${telAstreinte() ? "checked" : ""} style="width:22px;height:22px;flex:none;margin-top:2px;">
       <span><b>Ce téléphone est le téléphone d'astreinte</b><br><span style="color:var(--text-dim);font-size:.88rem;">À cocher uniquement sur le téléphone dédié à l'astreinte : il affiche la passation et une alerte si le planning indique quelqu'un d'autre. Décochée (téléphone personnel), on voit seulement qui est d'astreinte.</span></span>

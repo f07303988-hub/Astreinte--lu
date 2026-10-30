@@ -3,7 +3,7 @@
 // bibliothèque cartographique (Leaflet) et des tuiles OpenStreetMap déjà
 // consultées, pour que la carte reste utilisable hors connexion sur les
 // zones déjà visitées.
-const CACHE_NAME = "pasly-astreinte-v17";
+const CACHE_NAME = "pasly-astreinte-v18";
 const SHELL_FILES = [
   "./index.html",
   "./manifest.json",
@@ -82,4 +82,40 @@ self.addEventListener("fetch", (event) => {
       return cached || network;
     })
   );
+});
+
+// ---- Notifications de nouveaux incidents (envoyées par le serveur de la mairie) ----
+self.addEventListener("push", (event) => {
+  let d = {};
+  try { d = event.data ? event.data.json() : {}; } catch (e) { d = { title: "Pasly Astreinte", body: event.data ? event.data.text() : "" }; }
+  const titre = String(d.title || "Nouvel incident d'astreinte").slice(0, 120);
+  event.waitUntil((async () => {
+    await self.registration.showNotification(titre, {
+      body: String(d.body || "").slice(0, 400),
+      tag: String(d.tag || "pasly-astreinte"),
+      renotify: true,
+      requireInteraction: !!d.urgent,
+      icon: "icon-192.png",
+      badge: "icon-192.png",
+      data: { url: String(d.url || "./") }
+    });
+    // Appli ouverte : elle va chercher l'incident tout de suite
+    const fenetres = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    fenetres.forEach((c) => c.postMessage({ type: "nouvel-incident" }));
+  })());
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const cible = new URL((event.notification.data && event.notification.data.url) || "./", self.registration.scope).href;
+  event.waitUntil((async () => {
+    const fenetres = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    for (const c of fenetres) {
+      if (c.url.startsWith(self.registration.scope)) {
+        try { await c.navigate(cible); } catch (e) {}
+        return c.focus();
+      }
+    }
+    return self.clients.openWindow(cible);
+  })());
 });
