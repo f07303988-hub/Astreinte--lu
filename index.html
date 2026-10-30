@@ -567,7 +567,7 @@ function estMonSignalement(id){ return !!(state.mesSignalements && state.mesSign
 const MSG_SIGNALEMENT = "Mode signalement : seul l'incident que vous avez signalé peut être complété";
 
 /* Toute modification passe par ici : horodatage, puis envoi dès que possible */
-const CHAMPS_FUSION_EXCLUS = ["uuid","history","photos","updatedAt","fieldTs","lastSharedAt","travauxId","travauxEnCours"];
+const CHAMPS_FUSION_EXCLUS = ["uuid","history","photos","updatedAt","fieldTs","lastSharedAt","travauxId","travauxEnCours","photosSupprimees"];
 async function incidentPut(incident){
   const now = new Date().toISOString();
   // Heure de modification de chaque champ : en cas de saisies sur deux téléphones, chaque champ garde la valeur la plus récente
@@ -617,6 +617,7 @@ function nettoyerDistant(d, uuidColonne){
   if(d.fieldTs && typeof d.fieldTs === "object") for(const [k, v] of Object.entries(d.fieldTs)) if(date(v)) out.fieldTs[k] = v;
   if(typeof d.travauxId === "string" && /^[0-9a-f-]{36}$/i.test(d.travauxId)) out.travauxId = d.travauxId;
   if(date(d.lastSharedAt)) out.lastSharedAt = d.lastSharedAt;
+  if(Array.isArray(d.photosSupprimees)) out.photosSupprimees = d.photosSupprimees.filter(c => typeof c === "string" && /^[0-9a-f-]{36}\/[a-z]+-[0-9]+\.jpg$/i.test(c)).slice(0, 200);
   return out;
 }
 
@@ -643,7 +644,9 @@ function mergeIncidents(a, b){
     const k = (ph.phase||"") + "|" + ph.ts, prev = p.get(k) || {};
     p.set(k, { ...prev, ...ph, dataUrl: ph.dataUrl || prev.dataUrl, chemin: ph.chemin || prev.chemin });
   }
-  out.photos = [...p.values()].sort((x, y) => String(x.ts).localeCompare(String(y.ts)));
+  const supprimees = [...new Set([...(a.photosSupprimees || []), ...(b.photosSupprimees || [])])];
+  if(supprimees.length) out.photosSupprimees = supprimees;
+  out.photos = [...p.values()].filter(ph => !(ph.chemin && supprimees.includes(ph.chemin))).sort((x, y) => String(x.ts).localeCompare(String(y.ts)));
   out.travauxId = a.travauxId || b.travauxId || null;
   if(a.lastSharedAt || b.lastSharedAt) out.lastSharedAt = [a.lastSharedAt, b.lastSharedAt].filter(Boolean).sort().pop();
   out.updatedAt = [a.updatedAt, b.updatedAt, a.createdAt].filter(Boolean).sort().pop();
@@ -933,14 +936,41 @@ async function initSync(){
    Téléphone relié à la mairie : c'est le serveur qui efface (chaque nuit), le téléphone reçoit le résultat.
    Téléphone non relié : l'effacement se fait ici, à l'ouverture de l'appli. */
 const DELAI_ANONYMISATION_JOURS = 30;
+const dateCloture = (inc) => {
+  const c = (inc.history || []).filter(h => /^Statut : (Résolu|Archivé)/.test(h.text || "")).map(h => h.ts).sort();
+  return c[0] || inc.updatedAt || inc.createdAt;
+};
+/* Durées de conservation sur le téléphone, identiques à celles du serveur :
+   incidents clos effacés après 5 ans (tous les téléphones) ; photos retirées 1 an après la clôture
+   (téléphones non reliés ; pour les autres, la mairie s'en charge et le téléphone suit). */
+async function conservationLocale(){
+  const maintenant = Date.now(), relie = !!(state.sync && state.sync.connected);
+  const pend = await pendingGet(); let pendModifie = false;
+  for(const inc of await incidentAll()){
+    if(!["RESOLU","ARCHIVE"].includes(inc.status)) continue;
+    const clos = new Date(dateCloture(inc)).getTime();
+    if(!clos) continue;
+    if(clos < maintenant - 5 * 365.25 * 86400000){
+      await incidentDelete(inc.uuid);
+      if(pend.delete(inc.uuid)) pendModifie = true;
+      continue;
+    }
+    if(!relie && (inc.photos || []).length && clos < maintenant - 365 * 86400000){
+      const ts = new Date().toISOString(), n = inc.photos.length;
+      inc.photos = [];
+      inc.history = [...(inc.history || []), { ts, text:`📷 Photos supprimées (${n}), 1 an après la clôture` }];
+      await incidentPutLocal(inc);
+    }
+  }
+  if(pendModifie) await pendingSave(pend);
+}
 async function anonymiserLocal(){
   if(state.sync && state.sync.connected) return;
   const limite = Date.now() - DELAI_ANONYMISATION_JOURS * 86400000;
   for(const inc of await incidentAll()){
     if(!["RESOLU","ARCHIVE"].includes(inc.status)) continue;
     if(!(inc.reporterPhone || inc.reporterComment || (inc.reporterName && inc.reporterName !== "Habitant (anonymisé)"))) continue;
-    const clotures = (inc.history || []).filter(h => /^Statut : (Résolu|Archivé)/.test(h.text || "")).map(h => h.ts).sort();
-    const clos = clotures[0] || inc.updatedAt || inc.createdAt;
+    const clos = dateCloture(inc);
     if(!clos || new Date(clos).getTime() > limite) continue;
     const ts = new Date().toISOString();
     inc.reporterName = inc.reporterName ? "Habitant (anonymisé)" : "";
@@ -3430,6 +3460,7 @@ async function init(){
     await ajouterContactSuez();
     await initSync();
     try{ await anonymiserLocal(); }catch(e){}
+    try{ await conservationLocale(); }catch(e){}
   }catch(e){
     document.getElementById("app").innerHTML = "<p style='padding:24px;'>Erreur d'initialisation de l'application. Rechargez la page.</p>";
     return;
