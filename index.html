@@ -990,7 +990,7 @@ async function renderAdminServeur(){
       <button class="big-btn secondary" id="srvLogout"><span class="ic">⏏️</span><span class="lbl">Déconnecter ce téléphone</span></button>
     ` : `
       <div class="card">
-        <p style="margin-top:0;">Connectez ce téléphone avec un compte de l'application des contrôles. Rôle <b>administrateur</b> ou <b>contributeur</b> : saisie des incidents (un compte dédié, par exemple astreinte@pasly.fr, est conseillé pour le téléphone d'astreinte). Rôle <b>agent</b> ou <b>lecteur</b> : mode signalement, l'agent signale des incidents et voit ceux des autres, sans changer les statuts.</p>
+        <p style="margin-top:0;">Connectez ce téléphone avec un compte de l'application des contrôles. Rôle <b>administrateur</b> ou <b>contributeur</b> : saisie des incidents (un compte dédié, par exemple astreinte@pasly.fr, est conseillé pour le téléphone d'astreinte). Rôle <b>agent</b> ou <b>lecteur</b> : mode signalement, l'agent signale des incidents et ne voit que les siens, sans changer les statuts.</p>
         <label style="display:block;margin-bottom:10px;">Adresse e-mail<input id="srvEmail" type="email" autocomplete="username" value="${esc(email)}" style="width:100%;"></label>
         <label style="display:block;margin-bottom:10px;">Mot de passe<input id="srvPass" type="password" autocomplete="current-password" style="width:100%;"></label>
         <p style="color:var(--text-dim);font-size:.85rem;">Les codes PIN des élus et agents restent inchangés : ils servent toujours à ouvrir l'application.</p>
