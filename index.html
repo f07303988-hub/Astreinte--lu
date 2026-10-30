@@ -929,6 +929,28 @@ async function initSync(){
   document.addEventListener("visibilitychange", () => { if(!document.hidden) scheduleSync(500); });
 }
 
+/* ---- Anonymisation : coordonnées de l'habitant effacées 30 jours après la clôture ----
+   Téléphone relié à la mairie : c'est le serveur qui efface (chaque nuit), le téléphone reçoit le résultat.
+   Téléphone non relié : l'effacement se fait ici, à l'ouverture de l'appli. */
+const DELAI_ANONYMISATION_JOURS = 30;
+async function anonymiserLocal(){
+  if(state.sync && state.sync.connected) return;
+  const limite = Date.now() - DELAI_ANONYMISATION_JOURS * 86400000;
+  for(const inc of await incidentAll()){
+    if(!["RESOLU","ARCHIVE"].includes(inc.status)) continue;
+    if(!(inc.reporterPhone || inc.reporterComment || (inc.reporterName && inc.reporterName !== "Habitant (anonymisé)"))) continue;
+    const clotures = (inc.history || []).filter(h => /^Statut : (Résolu|Archivé)/.test(h.text || "")).map(h => h.ts).sort();
+    const clos = clotures[0] || inc.updatedAt || inc.createdAt;
+    if(!clos || new Date(clos).getTime() > limite) continue;
+    const ts = new Date().toISOString();
+    inc.reporterName = inc.reporterName ? "Habitant (anonymisé)" : "";
+    inc.reporterPhone = ""; inc.reporterComment = "";
+    inc.fieldTs = { ...(inc.fieldTs || {}), reporterName:ts, reporterPhone:ts, reporterComment:ts };
+    inc.history = [...(inc.history || []), { ts, text:`🔒 Coordonnées de l'habitant effacées (${DELAI_ANONYMISATION_JOURS} jours après la clôture)` }];
+    await incidentPutLocal(inc);
+  }
+}
+
 /* ---- Notifications de nouveaux incidents ---- */
 const estIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 const estInstallee = () => window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
@@ -3407,6 +3429,7 @@ async function init(){
     await loadConfig();
     await ajouterContactSuez();
     await initSync();
+    try{ await anonymiserLocal(); }catch(e){}
   }catch(e){
     document.getElementById("app").innerHTML = "<p style='padding:24px;'>Erreur d'initialisation de l'application. Rechargez la page.</p>";
     return;
