@@ -833,6 +833,11 @@ async function syncConfig(sb){
       tsLocal[k] = dts; applique = true;
     } else if(dts && dts >= lts){
       tsLocal[k] = dts;
+    } else if(!dts && !lts && !modeSignalement() && state[k] !== null && state[k] !== undefined){
+      // Rien sur le serveur : ce téléphone envoie ses réglages (même par défaut), avec une date ancienne
+      // pour que toute modification faite ailleurs l'emporte
+      const ancien = "2000-01-01T00:00:00.000Z";
+      fusion[k] = { v:state[k], ts:ancien, par:state.currentUser || "" }; tsLocal[k] = ancien; aEnvoyer = true;
     } else if(lts && lts > dts && !modeSignalement()){
       fusion[k] = { v:state[k], ts:lts, par:state.currentUser || "" }; aEnvoyer = true;
     }
@@ -2861,7 +2866,7 @@ function renderNumeros(params){
 function renderConsignes(){
   app.innerHTML = `
     ${topbar("Consignes d'astreinte", "home")}
-    <div class="card">${esc(state.consignes).split("\n\n").map(p=>`<p>${p.split("\n").map(esc).join("<br>")}</p>`).join("")}</div>
+    <div class="card">${String(state.consignes || "").split("\n\n").map(p=>`<p>${p.split("\n").map(esc).join("<br>")}</p>`).join("")}</div>
   `;
 }
 
